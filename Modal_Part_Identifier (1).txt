@@ -1,0 +1,1374 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Ansys Mechanical 2024 R2 - Cyclic (Prestress) Modal Part Identifier
+# =============================================================================
+import os, re
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (Form, Label, ComboBox, Button,
+                                  OpenFileDialog, TextBox, DialogResult,
+                                  FormStartPosition, ComboBoxStyle, MessageBox,
+                                  CheckBox, FormBorderStyle, GroupBox,
+                                  MessageBoxButtons, Application,
+                                  ProgressBar, ProgressBarStyle)
+from System.Drawing import Size, Point, Font, FontStyle, Color
+import Microsoft.Win32 as Win32
+
+try:
+    from Ansys.ACT.Interfaces.Common import SelectionTypeEnum
+except:
+    SelectionTypeEnum = None
+
+# =============================================================================
+# STIL
+# =============================================================================
+FONT_TITLE = None   # main() icinde set edilecek (Bold)
+PAD   = 14
+ROW_H = 30
+GRP_W = 580
+
+# Renk sabitleri (resme uygun)
+CLR_BTN_RUN    = Color.FromArgb(0,  120, 212)   # mavi  - Run
+CLR_BTN_RUN_FG = Color.White
+CLR_BTN_REM    = Color.FromArgb(196, 43,  28)   # kirmizi - "-" butonu
+CLR_BTN_REM_FG = Color.White
+CLR_BTN_NORM   = Color.FromArgb(225, 225, 225)  # gri - normal butonlar
+
+def _no_scroll_cmb(cmb):
+    """Mouse wheel ile ComboBox seciminin degismesini engelle."""
+    def _block(s, e):
+        try: e.Handled = True
+        except: pass
+    cmb.MouseWheel += _block
+    return cmb
+
+def _style_btn(btn, kind="normal"):
+    """Butona renk stili uygula."""
+    try:
+        from System.Windows.Forms import FlatStyle
+        btn.FlatStyle = FlatStyle.Flat
+        btn.FlatAppearance.BorderSize = 0
+        if kind == "run":
+            btn.BackColor = CLR_BTN_RUN
+            btn.ForeColor = CLR_BTN_RUN_FG
+        elif kind == "remove":
+            btn.BackColor = CLR_BTN_REM
+            btn.ForeColor = CLR_BTN_REM_FG
+        else:
+            btn.BackColor = CLR_BTN_NORM
+            btn.ForeColor = Color.Black
+    except: pass
+
+# =============================================================================
+# REGISTRY
+# =============================================================================
+REG_KEY = r"Software\ModalPartID"
+
+def _reg_get(name):
+    try:
+        key = Win32.Registry.CurrentUser.OpenSubKey(REG_KEY)
+        if key is None: return ""
+        val = key.GetValue(name); key.Close()
+        return str(val) if val else ""
+    except: return ""
+
+def _reg_set(name, val):
+    try:
+        key = Win32.Registry.CurrentUser.CreateSubKey(REG_KEY)
+        key.SetValue(name, val); key.Close()
+    except: pass
+
+# =============================================================================
+# YARDIMCILAR
+# =============================================================================
+_TMP    = [0]
+SE_EXPR = "ENERGYPOTENTIAL"
+
+def get_temp_path(name):
+    tmp = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Temp"
+    if not os.path.exists(tmp): os.makedirs(tmp)
+    return os.path.join(tmp, name)
+
+def fmt6(v):
+    try: return "{0:.6g}".format(float(v))
+    except: return str(v)
+
+def sanitize(name):
+    out = ""
+    for ch in str(name):
+        out += "_" if ch in '\\/:*?"<>|' else ch
+    return out.strip()
+
+# =============================================================================
+# NS GROUP YARDIMCISI
+# Named Selection Group (klasor tipi) icindeki tum NS isimlerini dondurur.
+# =============================================================================
+def get_ns_groups(model):
+    """Donus: {group_name: [ns_name, ...]}"""
+    groups = {}
+    try:
+        root = model.NamedSelections
+        for child in root.Children:
+            # Grup nesnesi: Children property'si var ve bos degil
+            try:
+                sub = list(child.Children)
+                if len(sub) > 0:
+                    names = []
+                    for ns in sub:
+                        try: names.append(ns.Name)
+                        except: pass
+                    if names:
+                        groups[child.Name] = names
+            except:
+                pass
+    except: pass
+    return groups
+
+def get_ns_names(model):
+    """Tum NS isimlerini dondurur (gruplar dahil)."""
+    names = []
+    try:
+        for item in model.NamedSelections.Children:
+            # Ust seviye NS
+            try:
+                sub = list(item.Children)
+                if len(sub) > 0:
+                    # Bu bir grup, icerigini ekle
+                    for ns in sub:
+                        try: names.append(ns.Name)
+                        except: pass
+                else:
+                    names.append(item.Name)
+            except:
+                names.append(item.Name)
+    except: pass
+    return names
+
+# =============================================================================
+# solve.out PARSER
+# =============================================================================
+def parse_out(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    results = {}
+    cur_hi  = None
+
+    def detect_dir(line):
+        u = line.upper()
+        if "PARTICIPATION FACTOR CALCULATION" not in u: return None
+        tail = u.split("*****")[-1]
+        for d in ["ROTX","ROTY","ROTZ"]:
+            if d in tail: return d
+        m = re.search(r"\b([XYZ])\s+DIRECTION", tail)
+        if m: return m.group(1)
+        return None
+
+    i = 0
+    while i < len(lines):
+        u = lines[i].upper()
+        m = re.search(r"CYCLIC SYMMETRY HARMONIC INDEX\s*[.\s]*(\d+)", u)
+        if m:
+            cur_hi = int(m.group(1))
+            results.setdefault(cur_hi, {})
+            i += 1; continue
+        d = detect_dir(lines[i])
+        if d is not None and d in ["X","Y","Z"]:
+            if cur_hi is None: cur_hi = 0
+            results.setdefault(cur_hi, {})
+            j = i + 1
+            while j < len(lines):
+                if "MODE" in lines[j].upper() and "FREQUENCY" in lines[j].upper():
+                    j += 1; break
+                j += 1
+            while j < len(lines):
+                lj = lines[j].strip()
+                if not lj: j += 1; continue
+                if lj.startswith("---") or lj.lower().startswith("sum"): break
+                parts = lj.split()
+                try:
+                    mode = int(parts[0])
+                    freq = float(parts[1])
+                    frac = float(parts[7]) if len(parts) >= 8 else None
+                    results[cur_hi].setdefault(mode, {"freq": freq})
+                    if frac is not None:
+                        results[cur_hi][mode][d]     = frac
+                        results[cur_hi][mode]["freq"] = freq
+                except: pass
+                j += 1
+            i = j; continue
+        i += 1
+
+    out = []
+    for hi in sorted(results.keys()):
+        modes_dict = {}
+        for mode in sorted(results[hi].keys()):
+            rec = results[hi][mode]
+            modes_dict[mode] = {
+                "freq": rec.get("freq", 0.0),
+                "X":    rec.get("X", 0.0),
+                "Y":    rec.get("Y", 0.0),
+                "Z":    rec.get("Z", 0.0),
+            }
+        out.append({"hi": hi, "modes": modes_dict})
+    return out
+
+def eliminate_twins(parsed, twin_hz):
+    """Her HI icinde frekans farki <= twin_hz olan modlardan birini eler.
+    Kural: twin ciftinden max effective mass'e sahip olanı tut.
+    EM esit veya EM veri yoksa: dusuk mod numarasini tut.
+    Donus: parsed ile ayni yapi ama twin'ler elenmiş.
+    Ayrica twin bilgisi loglanır: {hi: [(kept_mode, elim_mode, freq_diff), ...]}
+    """
+    twin_log = {}
+    out = []
+    for block in parsed:
+        hi    = block["hi"]
+        modes = block["modes"]
+        # Frekansa gore sirala
+        sorted_modes = sorted(modes.keys(), key=lambda m: modes[m]["freq"])
+        eliminated   = set()
+        twin_log[hi] = []
+
+        for idx in range(len(sorted_modes) - 1):
+            m1 = sorted_modes[idx]
+            m2 = sorted_modes[idx + 1]
+            if m1 in eliminated or m2 in eliminated:
+                continue
+            f1 = modes[m1]["freq"]
+            f2 = modes[m2]["freq"]
+            if abs(f2 - f1) <= twin_hz:
+                # Twin bulundu: hangisini tut?
+                em1 = max(modes[m1].get("X",0), modes[m1].get("Y",0), modes[m1].get("Z",0))
+                em2 = max(modes[m2].get("X",0), modes[m2].get("Y",0), modes[m2].get("Z",0))
+                if em2 > em1:
+                    kept = m2; elim = m1
+                else:
+                    kept = m1; elim = m2  # esitse veya m1 buyukse dusuk no (m1) kalir
+                eliminated.add(elim)
+                twin_log[hi].append((kept, elim, abs(f2 - f1)))
+                print("  Twin: HI{0} M{1}({2:.1f}Hz) ~ M{3}({4:.1f}Hz) diff={5:.3f}Hz -> kept M{6}".format(
+                    hi, m1, f1, m2, f2, abs(f2-f1), kept))
+
+        # Elenenleri cikar
+        new_modes = {m: modes[m] for m in modes if m not in eliminated}
+        out.append({"hi": hi, "modes": new_modes})
+
+        if eliminated:
+            print("  HI{0}: {1} twin eliminated, {2} modes remain".format(
+                hi, len(eliminated), len(new_modes)))
+
+    return out, twin_log
+
+def select_modes(parsed, thr_pct):
+    thr = thr_pct / 100.0
+    out = {}
+    for block in parsed:
+        hi = block["hi"]
+        for mode, rec in block["modes"].items():
+            best = max(["X","Y","Z"], key=lambda d: rec[d])
+            if rec[best] >= thr:
+                out.setdefault(hi, {})[mode] = dict(rec, maxdir=best, maxval=rec[best])
+    return out
+
+# =============================================================================
+# NS / UDR YARDIMCILARI
+# =============================================================================
+def find_ns(model, ns_name):
+    # Ust seviye ve grup icindeki NS'leri ara
+    try:
+        for item in model.NamedSelections.Children:
+            try:
+                sub = list(item.Children)
+                if len(sub) > 0:
+                    for ns in sub:
+                        try:
+                            if ns.Name == ns_name: return ns
+                        except: pass
+                else:
+                    if item.Name == ns_name: return item
+            except:
+                if item.Name == ns_name: return item
+    except: pass
+    return None
+
+def set_mode(obj, m):
+    # InternalObject.CyclicMode en guvenilir yol (debug ile teyit edildi)
+    try:
+        obj.InternalObject.CyclicMode = m
+        return True
+    except: pass
+    for attr in ["CyclicMode", "Mode", "SetNumber"]:
+        try: setattr(obj, attr, m); return True
+        except: pass
+    return False
+
+def set_hindex(obj, hi):
+    # InternalObject.CyclicHarmonicIndex en guvenilir yol (debug ile teyit edildi)
+    try:
+        obj.InternalObject.CyclicHarmonicIndex = hi
+        return True
+    except: pass
+    for attr in ["HarmonicIndex", "CyclicHarmonicIndex"]:
+        try: setattr(obj, attr, hi); return True
+        except: pass
+    return False
+
+def _sum_plotdata(obj):
+    try: pd_data = obj.PlotData
+    except: return None
+    vals = None
+    try: vals = pd_data["Values"]
+    except:
+        try: vals = pd_data.Values
+        except: vals = None
+    if vals is None: return None
+    s = 0.0; cnt = 0
+    try:
+        for v in vals:
+            try: s += float(v); cnt += 1
+            except: pass
+    except: return None
+    return s if cnt else None
+
+def _sum_file(path):
+    s = 0.0
+    try:
+        with open(path, "r") as f: lines = f.readlines()
+    except: return 0.0
+    for line in lines[1:]:
+        line = line.strip()
+        if not line: continue
+        p = line.split("\t")
+        if len(p) < 2: p = line.split()
+        if len(p) < 2: continue
+        try: s += float(p[-1].strip().replace(",","."))
+        except: continue
+    return s
+
+def read_udr_value(obj):
+    s = _sum_plotdata(obj)
+    if s is not None: return s
+    _TMP[0] += 1
+    tmp = get_temp_path("_mid_{0}.txt".format(_TMP[0]))
+    try:
+        if os.path.exists(tmp): os.remove(tmp)
+    except: pass
+    try: obj.ExportToTextFile(tmp)
+    except: return 0.0
+    return _sum_file(tmp)
+
+# =============================================================================
+# PROGRESS POPUP
+# Cancel flag: _CANCEL[0] = True olunca compute() temiz cikiyor.
+# =============================================================================
+_CANCEL = [False]
+
+class ProgressDialog(Form):
+    def __init__(self):
+        self.Text            = "Modal Part Identifier - Processing"
+        self.Font            = FONT_TITLE
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedSingle
+        self.MaximizeBox     = True
+        self.MinimizeBox     = True   # simge durumuna kucultebilir
+        self.ControlBox      = True   # kapat/kucult/buyut duzmeleri gorunur
+        self.TopMost         = True   # her zaman onplanda
+        self.ClientSize      = Size(520, 130)
+
+        self.lbl_step = Label()
+        self.lbl_step.Text     = "Initializing..."
+        self.lbl_step.Location = Point(14, 14)
+        self.lbl_step.Size     = Size(492, 22)
+        self.lbl_step.Font     = FONT_TITLE
+        self.Controls.Add(self.lbl_step)
+
+        self.lbl_detail = Label()
+        self.lbl_detail.Text      = ""
+        self.lbl_detail.Location  = Point(14, 40)
+        self.lbl_detail.Size      = Size(492, 20)
+        self.lbl_detail.ForeColor = Color.DimGray
+        self.Controls.Add(self.lbl_detail)
+
+        self.bar = ProgressBar()
+        self.bar.Location = Point(14, 68)
+        self.bar.Size     = Size(390, 22)
+        self.bar.Style    = ProgressBarStyle.Marquee
+        self.bar.MarqueeAnimationSpeed = 30
+        self.Controls.Add(self.bar)
+
+        self.btn_cancel = Button()
+        self.btn_cancel.Text     = "Stop"
+        self.btn_cancel.Location = Point(414, 65)
+        self.btn_cancel.Size     = Size(92, 28)
+        self.btn_cancel.Click   += self._on_cancel
+        _style_btn(self.btn_cancel, "remove")
+        self.Controls.Add(self.btn_cancel)
+
+        # Pencere kapaninca da iptal et
+        self.FormClosing += self._on_closing
+
+    def _on_cancel(self, s, a):
+        _CANCEL[0] = True
+        self.lbl_step.Text   = "Cancelling..."
+        self.lbl_detail.Text = "Waiting for current operation to finish."
+        self.btn_cancel.Enabled = False
+        Application.DoEvents()
+
+    def _on_closing(self, s, a):
+        # X'e basilinca da iptal
+        if not _CANCEL[0]:
+            _CANCEL[0] = True
+
+    def update(self, step, detail=""):
+        self.lbl_step.Text   = step
+        self.lbl_detail.Text = detail
+        Application.DoEvents()
+
+    def done(self):
+        self.bar.Style = ProgressBarStyle.Continuous
+        self.bar.Value = 100
+        Application.DoEvents()
+
+# =============================================================================
+# GRUPLAMA
+# Olusturulan sonuclari iki gruba ayirir:
+#   "Strain Energy Results"  -> _SE_* ile baslayan UDR'ler
+#   "Mode Shape Results"     -> _MS_* ile baslayan TD'ler
+# =============================================================================
+def group_results(sol, model, group_se=True, group_ms=True):
+    """_SE_* ve/veya _MS_* onekli sonuclari ilgili gruba tasir.
+    model.AddTreeGroupingFolder(list) kullanir (debug ile teyit edildi).
+    """
+    try:
+        if group_se:
+            se_items = []
+            for child in list(sol.Children):
+                try:
+                    if str(child.Name).startswith("_SE_"):
+                        se_items.append(child)
+                except: pass
+            if se_items:
+                try:
+                    grp = model.AddTreeGroupingFolder(se_items)
+                    grp.Name = "Strain Energy Results"
+                    print("SE gruplama: {0} sonuc".format(len(se_items)))
+                except Exception as ex:
+                    # Liste calismazsa tek tek dene
+                    try:
+                        grp = model.AddTreeGroupingFolder(se_items[0])
+                        grp.Name = "Strain Energy Results"
+                        for item in se_items[1:]:
+                            try: item.GroupingFolder = grp
+                            except: pass
+                        print("SE gruplama (tek tek): {0} sonuc".format(len(se_items)))
+                    except Exception as ex2:
+                        print("SE gruplama hatasi:", ex2)
+
+        if group_ms:
+            ms_items = []
+            for child in list(sol.Children):
+                try:
+                    if str(child.Name).startswith("_MS_"):
+                        ms_items.append(child)
+                except: pass
+            if ms_items:
+                try:
+                    grp = model.AddTreeGroupingFolder(ms_items)
+                    grp.Name = "Mode Shape Results"
+                    print("MS gruplama: {0} sonuc".format(len(ms_items)))
+                except Exception as ex:
+                    try:
+                        grp = model.AddTreeGroupingFolder(ms_items[0])
+                        grp.Name = "Mode Shape Results"
+                        for item in ms_items[1:]:
+                            try: item.GroupingFolder = grp
+                            except: pass
+                        print("MS gruplama (tek tek): {0} sonuc".format(len(ms_items)))
+                    except Exception as ex2:
+                        print("MS gruplama hatasi:", ex2)
+
+    except Exception as ex:
+        print("Gruplama hatasi (kritik degil):", ex)
+# =============================================================================
+import Ansys.Mechanical.DataModel.Enums as _E
+_SDS = _E.SetDriverStyle
+
+def _parse_phase_deg(quantity_str):
+    """'349.99 [deg]' veya '350.0 [mm]' gibi stringden sayiyi cek."""
+    try:
+        s = str(quantity_str).strip()
+        # "[" dan oncesini al
+        num = s.split("[")[0].strip()
+        return float(num)
+    except:
+        return 0.0
+
+def _get_max_node_from_export(td, sol):
+    """Total Deformation'i export edip max node ID'yi bul.
+    Export formatı: NodeID  X  Y  Z  Value (tab ayracli)
+    En yüksek Value satirindaki NodeID dondurulur."""
+    _TMP[0] += 1
+    tmp = get_temp_path("_td_export_{0}.txt".format(_TMP[0]))
+    try:
+        if os.path.exists(tmp): os.remove(tmp)
+    except: pass
+    try:
+        td.ExportToTextFile(tmp)
+    except:
+        return None
+    max_val  = -1e300
+    max_node = None
+    try:
+        with open(tmp, "r") as f:
+            lines = f.readlines()
+        for line in lines[1:]:   # ilk satir header
+            line = line.strip()
+            if not line: continue
+            parts_line = line.split("\t")
+            if len(parts_line) < 2:
+                parts_line = line.split()
+            if len(parts_line) < 2: continue
+            try:
+                node_id = int(parts_line[0].strip())
+                val     = float(parts_line[-1].strip().replace(",","."))
+                if val > max_val:
+                    max_val  = val
+                    max_node = node_id
+            except: continue
+    except: pass
+    try: os.remove(tmp)
+    except: pass
+    return max_node
+
+def add_mode_shapes(sol, selected, prog=None):
+    """HI >= 1 olan her (HI, mode) icin 3 adimli mode shape olusturur:
+       1) TD (MaximumOfCyclicPhase)           -> _MS_MAX_{hi}_{mode}
+       2) TD (CyclicPhaseOfMaximum, node)     -> _MS_PHZ_{hi}_{mode}
+          Maximum degeri = phase acisi (deg)
+       3) TD (ResultSet/CyclicPhase, phase)   -> _MS_FNL_{hi}_{mode}
+       HI=0 icin sadece standart TD (ResultSet) olusturulur -> _MS_HI0_{mode}
+    """
+    def _upd(step, detail=""):
+        print(step + ("  " + detail if detail else ""))
+        if prog: prog.update(step, detail)
+
+    def _cancelled():
+        Application.DoEvents()
+        return _CANCEL[0]
+
+    def _make_td(name, hi, mode):
+        td = sol.AddTotalDeformation()
+        set_hindex(td, hi)
+        set_mode(td, mode)
+        td.Name = name
+        return td
+
+    for hi in sorted(selected.keys()):
+        for mode in sorted(selected[hi].keys()):
+            if _cancelled(): return
+
+            freq = selected[hi][mode]["freq"]
+
+            if hi == 0:
+                # HI=0: standart Total Deformation, By=ResultSet (default)
+                _upd("Mode Shape HI {0} Mode {1}".format(hi, mode),
+                     "Standard TD  f={0:.0f} Hz".format(freq))
+                td0 = _make_td("_MS_HI0_M{0}".format(mode), hi, mode)
+                sol.EvaluateAllResults()
+                if _cancelled(): return
+            else:
+                # ADIM 1: MaximumOfCyclicPhase
+                _upd("Mode Shape HI {0} Mode {1}  [1/3 Max over phase]".format(hi, mode),
+                     "f={0:.0f} Hz".format(freq))
+                td_max = _make_td("_MS_MAX_HI{0}_M{1}".format(hi, mode), hi, mode)
+                td_max.By = _SDS.MaximumOfCyclicPhase
+                sol.EvaluateAllResults()
+                if _cancelled(): return
+
+                # Max node'u bul (export ile)
+                _upd("Mode Shape HI {0} Mode {1}  [finding max node]".format(hi, mode))
+                max_node = _get_max_node_from_export(td_max, sol)
+                print("  HI{0} M{1}: max node = {2}".format(hi, mode, max_node))
+
+                # ADIM 2: CyclicPhaseOfMaximum (node scope'lu)
+                _upd("Mode Shape HI {0} Mode {1}  [2/3 Phase of maximum]".format(hi, mode))
+                td_phz = _make_td("_MS_PHZ_HI{0}_M{1}".format(hi, mode), hi, mode)
+                td_phz.By = _SDS.CyclicPhaseOfMaximum
+                # Node scope: max_node bulunduysa NS veya geometry selection olmadan
+                # ScopingMethod = NodeID ile scope yapilir; yoksa tum model
+                if max_node is not None:
+                    try:
+                        sel_info = ExtAPI.SelectionManager.CreateSelectionInfo(
+                            SelectionTypeEnum.MeshNodes)
+                        sel_info.Ids = [max_node]
+                        td_phz.Location = sel_info
+                    except:
+                        pass
+                sol.EvaluateAllResults()
+                if _cancelled(): return
+
+                # Phase acisini Maximum'dan oku
+                phase_deg = _parse_phase_deg(td_phz.Maximum)
+                print("  HI{0} M{1}: phase = {2:.2f} deg".format(hi, mode, phase_deg))
+
+                # ADIM 3: ResultSet (Cyclic Phase) + CyclicPhase = phase_deg
+                _upd("Mode Shape HI {0} Mode {1}  [3/3 Final at phase {2:.0f} deg]".format(
+                    hi, mode, phase_deg))
+                td_fnl = _make_td("_MS_FNL_HI{0}_M{1}".format(hi, mode), hi, mode)
+                td_fnl.By = _SDS.ResultSet
+                try:
+                    td_fnl.CyclicPhase = Quantity("{0} [deg]".format(phase_deg))
+                    print("  CyclicPhase set: {0:.1f} deg".format(phase_deg))
+                except Exception as ex:
+                    print("  CyclicPhase atanamadi:", ex)
+                sol.EvaluateAllResults()
+                if _cancelled(): return
+
+                print("  HI{0} M{1}: final TD evaluated at {2:.1f} deg".format(
+                    hi, mode, phase_deg))
+
+# =============================================================================
+# HESAPLAMA
+# =============================================================================
+def compute(analysis, parts, selected, prog=None):
+    def _upd(step, detail=""):
+        print(step + ("  " + detail if detail else ""))
+        if prog: prog.update(step, detail)
+
+    def _cancelled():
+        Application.DoEvents()
+        return _CANCEL[0]
+
+    model = ExtAPI.DataModel.Project.Model
+    sol   = analysis.Solution
+
+    _upd("Resolving Named Selections...")
+    ns_map = {}
+    for p in parts:
+        ns = find_ns(model, p)
+        if ns is None:
+            MessageBox.Show("Named Selection not found: " + p, "Error")
+            return None
+        ns_map[p] = ns
+
+    total_hi_mode = sum(len(selected[hi]) for hi in selected)
+    energy = {}
+
+    for hi in sorted(selected.keys()):
+        if _cancelled(): return None
+        energy[hi] = {}
+
+    # ---- TUM UDR'LERI OLUSTUR ----
+    _upd("Creating all UDRs...",
+         "{0} combinations".format(
+             sum(len(selected[hi]) for hi in selected) * (len(parts) + 1)))
+
+    # all_objs[(hi,mode)]    = all-bodies UDR
+    # body_objs[(hi,mode,p)] = body UDR
+    all_objs  = {}
+    body_objs = {}
+    obj_count = [0]
+
+    for hi in sorted(selected.keys()):
+        for mode in sorted(selected[hi].keys()):
+            if _cancelled(): return None
+
+            # All Bodies UDR
+            o_all = sol.AddUserDefinedResult()
+            o_all.Expression = SE_EXPR
+            set_hindex(o_all, hi)
+            set_mode(o_all, mode)
+            o_all.Name = "_SE_ALL_HI{0}_M{1}".format(hi, mode)
+            try: o_all.DisplayOption = ResultAveragingType.Unaveraged
+            except: pass
+            all_objs[(hi, mode)] = o_all
+            obj_count[0] += 1
+
+            # Her body icin UDR
+            for p in parts:
+                o = sol.AddUserDefinedResult()
+                o.Expression = SE_EXPR
+                o.Location   = ns_map[p].Location
+                set_hindex(o, hi)
+                set_mode(o, mode)
+                o.Name = "_SE_{0}_HI{1}_M{2}".format(sanitize(p)[:14], hi, mode)
+                try: o.DisplayOption = ResultAveragingType.Unaveraged
+                except: pass
+                body_objs[(hi, mode, p)] = o
+                obj_count[0] += 1
+
+    # ---- TEK EVALUATE ----
+    if _cancelled(): return None
+    _upd("Evaluating all results...",
+         "{0} UDRs - single pass".format(obj_count[0]))
+    sol.EvaluateAllResults()
+
+    # ---- DEGERLERI OKU ----
+    if _cancelled(): return None
+    _upd("Reading results...")
+
+    for hi in sorted(selected.keys()):
+        energy[hi] = {}
+        for mode in sorted(selected[hi].keys()):
+            all_val   = read_udr_value(all_objs[(hi, mode)])
+            body_vals = {p: read_udr_value(body_objs[(hi, mode, p)]) for p in parts}
+            ratios    = {p: (body_vals[p] / all_val * 100.0) if all_val != 0 else 0.0
+                         for p in parts}
+            energy[hi][mode] = {
+                "all":    all_val,
+                "bodies": body_vals,
+                "ratio":  ratios,
+            }
+            ratio_str = "  ".join("{0}={1:.1f}%".format(p, ratios[p]) for p in parts)
+            print("  HI{0} M{1}: all={2:.3e}  {3}".format(hi, mode, all_val, ratio_str))
+
+    # UDR sonuclari tamamlandi -> once SE grubuna al
+    if not _cancelled():
+        _upd("Grouping Strain Energy results...")
+        group_results(sol, model, group_se=True, group_ms=False)
+
+    # Mode shape kismini baslat
+    if not _cancelled():
+        _upd("Creating mode shapes...")
+        add_mode_shapes(sol, selected, prog)
+
+    # Mode shape tamamlandi -> MS grubuna al
+    if not _cancelled():
+        _upd("Grouping Mode Shape results...")
+        group_results(sol, model, group_se=False, group_ms=True)
+
+    _upd("Done.", "All results remain in tree.")
+    return energy
+
+# =============================================================================
+# TXT RAPOR
+# =============================================================================
+def write_txt(path, parts, em_thr, se_thr, twin_hz, parsed, twin_log, selected, energy):
+    SEP  = "=" * 76
+    SEP2 = "-" * 76
+
+    dom_map = {}
+    for hi in sorted(energy.keys()):
+        for mode in sorted(energy[hi].keys()):
+            ratios = energy[hi][mode]["ratio"]
+            best   = max(parts, key=lambda p: ratios[p]) if parts else None
+            if best:
+                dom_map.setdefault(best, {}).setdefault(hi, []).append(mode)
+
+    se_flagged = set()
+    for hi in sorted(energy.keys()):
+        for mode in sorted(energy[hi].keys()):
+            ratios = energy[hi][mode]["ratio"]
+            if any(ratios[p] >= se_thr for p in parts):
+                se_flagged.add((hi, mode))
+
+    with open(path, "w") as f:
+        f.write("Cyclic Modal Part Identifier - Report\n")
+        f.write("Effective mass threshold : {0:.2f}%\n".format(em_thr))
+        f.write("Strain energy threshold  : {0:.2f}%\n".format(se_thr))
+        f.write("Twin mode tolerance      : {0:.3f} Hz\n".format(twin_hz))
+        f.write("SE expression            : {0}\n".format(SE_EXPR))
+        f.write("Ratio formula            : body / all_bodies * 100\n")
+        f.write(SEP + "\n\n")
+
+        # BOLUM 0: Twin mod eliminasyonu ozeti
+        total_twins = sum(len(twin_log.get(hi,[])) for hi in twin_log)
+        f.write("SECTION 0: TWIN MODE ELIMINATION  (tolerance: {0:.3f} Hz)\n".format(twin_hz))
+        f.write(SEP + "\n\n")
+        if total_twins == 0:
+            f.write("  No twin modes found.\n\n")
+        else:
+            f.write("  {0:>6}  {1:>8}  {2:>8}  {3:>10}  {4}\n".format(
+                "HI","Kept","Elim","Diff(Hz)","Note"))
+            f.write("  {0}\n".format(SEP2[:55]))
+            for hi in sorted(twin_log.keys()):
+                for (kept, elim, diff) in twin_log[hi]:
+                    f.write("  {0:>6}  {1:>8}  {2:>8}  {3:>10.4f}  lower EM eliminated\n".format(
+                        hi, kept, elim, diff))
+            f.write("\n  Total eliminated: {0}\n\n".format(total_twins))
+
+        # BOLUM 1: Effective Mass
+        f.write("SECTION 1: EFFECTIVE MASS  (all harmonic indices)\n")
+        f.write("(*) values exceeding threshold ({0:.2f}%)\n".format(em_thr))
+        f.write(SEP + "\n\n")
+
+        for block in parsed:
+            hi    = block["hi"]
+            modes = block["modes"]
+            f.write("  Harmonic Index {0}\n".format(hi))
+            f.write("  {0}\n".format(SEP2[:64]))
+            f.write("  {0:>6}  {1:>12}  {2:>11}  {3:>11}  {4:>11}  {5}\n".format(
+                "Mode", "Freq (Hz)", "X (%)", "Y (%)", "Z (%)", "Max"))
+            f.write("  {0}\n".format(SEP2[:76]))
+            for mode in sorted(modes.keys()):
+                rec  = modes[mode]
+                xp   = rec["X"] * 100
+                yp   = rec["Y"] * 100
+                zp   = rec["Z"] * 100
+                best = max(["X","Y","Z"], key=lambda d: rec[d])
+                def _fm(v):
+                    s = "{0:>10.3f}".format(v)
+                    return s + "*" if v >= em_thr else s + " "
+                f.write("  {0:>6}  {1:>12.2f}  {2}  {3}  {4}  {5}({6:.2f}%)\n".format(
+                    mode, rec["freq"], _fm(xp), _fm(yp), _fm(zp), best, rec[best]*100))
+            f.write("\n")
+
+        # BOLUM 2: Strain Energy
+        f.write(SEP + "\n")
+        f.write("SECTION 2: STRAIN ENERGY RATIO  (ENERGYPOTENTIAL, raw - not volume-normalized)\n")
+        f.write("Modes passing effective mass threshold ({0:.2f}%)\n".format(em_thr))
+        f.write("Ratio = body / all_bodies * 100\n")
+        f.write("(**) any body ratio >= SE threshold ({0:.2f}%)\n".format(se_thr))
+        f.write(SEP + "\n\n")
+
+        col_w = max(14, max(len(p) for p in parts) + 2)
+        # Baslik: body isimleri
+        hdr = "   {0:>6}  {1:>10}  {2:>16}  {3}  {4}".format(
+            "Mode", "Freq(Hz)", "All Bodies",
+            "  ".join(p.ljust(col_w) for p in parts), "Dominant")
+        # Birim satiri
+        hdr_unit = "   {0:>6}  {1:>10}  {2:>16}  {3}".format(
+            "", "", "[mJ]",
+            "  ".join("[mJ]".ljust(col_w) for p in parts))
+        # Oran satiri
+        hdr_r = "   {0:>6}  {1:>10}  {2:>16}  {3}".format(
+            "", "", "(raw)",
+            "  ".join("ratio(%)".ljust(col_w) for p in parts))
+
+        for hi in sorted(energy.keys()):
+            f.write("  Harmonic Index {0}\n".format(hi))
+            f.write("  {0}\n".format(SEP2[:64]))
+            f.write(hdr + "\n")
+            f.write(hdr_unit + "\n")
+            f.write(hdr_r + "\n")
+            f.write("  {0}\n".format(SEP2[:min(len(hdr), 76)]))
+            for mode in sorted(energy[hi].keys()):
+                rec    = energy[hi][mode]
+                ratios = rec["ratio"]
+                best   = max(parts, key=lambda p: ratios[p]) if parts else "-"
+                flag   = "**" if (hi, mode) in se_flagged else "  "
+                em_str = "{0:.1f}% [{1}]".format(
+                    selected[hi][mode]["maxval"]*100, selected[hi][mode]["maxdir"])
+                # Deger satirlari: sadece sayilar, hizalama bozulmuyor
+                body_cols  = "  ".join("{0:<{1}.4E}".format(rec["bodies"][p], col_w) for p in parts)
+                ratio_cols = "  ".join("{0:<{1}}".format(
+                    "{0:.2f}%".format(ratios[p]), col_w) for p in parts)
+                f.write("{0} {1:>6}  {2:>10.2f}  {3:>16.4E}  {4}  {5}\n".format(
+                    flag, mode, selected[hi][mode]["freq"], rec["all"], body_cols, best))
+                f.write("   {0:>6}  {1:>10}  {2:>16}  {3}  Effective Mass Ratio: {4}\n\n".format(
+                    "", "", "", ratio_cols, em_str))
+            f.write("\n")
+
+        # BOLUM 3: SE esigini gecenler
+        f.write(SEP + "\n")
+        f.write("SECTION 3: MODES EXCEEDING STRAIN ENERGY THRESHOLD ({0:.2f}%)\n".format(se_thr))
+        f.write(SEP + "\n\n")
+        if not se_flagged:
+            f.write("  No modes exceed the strain energy threshold.\n\n")
+        else:
+            f.write("  {0:>6}  {1:>6}  {2:>10}  {3:>12}  {4}\n".format(
+                "HI","Mode","Freq(Hz)","MaxRatio(%)","Body@Max"))
+            f.write("  {0}\n".format(SEP2[:60]))
+            for (hi, mode) in sorted(se_flagged):
+                ratios = energy[hi][mode]["ratio"]
+                best   = max(parts, key=lambda p: ratios[p])
+                f.write("  {0:>6}  {1:>6}  {2:>10.2f}  {3:>12.2f}%  {4}\n".format(
+                    hi, mode, selected[hi][mode]["freq"], ratios[best], best))
+            f.write("\n")
+
+        # BOLUM 4: Her body dominant oldugu modlar
+        f.write(SEP + "\n")
+        f.write("SECTION 4: DOMINANT MODES PER BODY\n")
+        f.write(SEP + "\n\n")
+        for p in parts:
+            f.write("  {0}\n".format(p))
+            if p not in dom_map:
+                f.write("    -> No dominant modes\n\n"); continue
+            for hi in sorted(dom_map[p].keys()):
+                mlist = sorted(dom_map[p][hi])
+                f.write("    HI {0}: modes {1}  ({2} total)\n".format(
+                    hi, ", ".join(str(m) for m in mlist), len(mlist)))
+            f.write("\n")
+
+        # BOLUM 5: SE esigini gecen modlar - body bazinda detay
+        f.write(SEP + "\n")
+        f.write("SECTION 5: MODES EXCEEDING STRAIN ENERGY THRESHOLD ({0:.2f}%) - BODY DETAIL\n".format(se_thr))
+        f.write(SEP + "\n\n")
+        if not se_flagged:
+            f.write("  No modes exceed the strain energy threshold.\n\n")
+        else:
+            # Her body icin o esigi gecen modlari listele
+            for p in parts:
+                flagged_for_body = []
+                for (hi, mode) in sorted(se_flagged):
+                    ratios = energy[hi][mode]["ratio"]
+                    if ratios[p] >= se_thr:
+                        flagged_for_body.append((hi, mode, ratios[p]))
+                if not flagged_for_body:
+                    continue
+                f.write("  {0}\n".format(p))
+                f.write("  {0}\n".format(SEP2[:50]))
+                f.write("  {0:>6}  {1:>6}  {2:>10}  {3:>12}\n".format(
+                    "HI", "Mode", "Freq(Hz)", "Ratio(%)"))
+                f.write("  {0}\n".format(SEP2[:44]))
+                for (hi, mode, ratio) in flagged_for_body:
+                    f.write("  {0:>6}  {1:>6}  {2:>10.2f}  {3:>12.2f}%\n".format(
+                        hi, mode, selected[hi][mode]["freq"], ratio))
+                f.write("\n")
+
+# =============================================================================
+# ANALIZ SECIM DIALOGU
+# =============================================================================
+class AnalysisSelectDialog(Form):
+    def __init__(self, analyses):
+        self.selected_analysis = None
+        self._analyses = analyses
+        self.Text            = "Select Analysis (Modal)"
+        self.Font            = FONT_TITLE
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False; self.MinimizeBox = False
+        self.ClientSize  = Size(460, 145)
+
+        lbl = Label()
+        lbl.Text     = "Multiple analyses found. Select the modal analysis:"
+        lbl.Location = Point(PAD, PAD); lbl.Size = Size(430, 35)
+        self.Controls.Add(lbl)
+
+        self.combo = ComboBox()
+        self.combo.Location = Point(PAD, 55); self.combo.Size = Size(430, 26)
+        self.combo.DropDownStyle = ComboBoxStyle.DropDownList
+        for idx, a in enumerate(analyses):
+            try: atype = str(a.AnalysisType)
+            except: atype = "Unknown"
+            self.combo.Items.Add("[{0}] {1}  ({2})".format(idx+1, a.Name, atype))
+        self.combo.SelectedIndex = 0
+        _no_scroll_cmb(self.combo)
+        self.Controls.Add(self.combo)
+
+        ok = Button(); ok.Text = "OK"
+        ok.Location = Point(270, 100); ok.Size = Size(85, 32)
+        ok.Click += self._ok
+        _style_btn(ok, "run")
+        self.Controls.Add(ok)
+        ca = Button(); ca.Text = "Cancel"
+        ca.Location = Point(365, 100); ca.Size = Size(85, 32)
+        ca.DialogResult = DialogResult.Cancel
+        _style_btn(ca)
+        self.Controls.Add(ca); self.CancelButton = ca
+
+    def _ok(self, s, a):
+        self.selected_analysis = self._analyses[self.combo.SelectedIndex]
+        self.DialogResult = DialogResult.OK; self.Close()
+
+# =============================================================================
+# ANA DIALOG
+# =============================================================================
+class ModalIdDialog(Form):
+    def __init__(self, ns_names, ns_groups):
+        self.ns_names   = ns_names    # tum NS isimleri (duz liste)
+        self.ns_groups  = ns_groups   # {group_name: [ns_name, ...]}
+        self.parts      = []
+        self.em_thr     = 5.0
+        self.se_thr     = 10.0
+        self.twin_hz    = 2.0
+        self.out_file   = ""
+        self.out_dir    = ""
+        self.Text            = "Cyclic Modal Part Identifier"
+        self.Font            = FONT_TITLE
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False; self.MinimizeBox = False
+        self.part_rows  = []
+        self._build()
+
+    def _mk_grp(self, title):
+        g = GroupBox(); g.Text = title; g.Font = FONT_TITLE
+        g.Width = GRP_W; self.Controls.Add(g); return g
+
+    def _build(self):
+        # 1) solve.out
+        self.grp_out = self._mk_grp("1)  .OUT File  (effective mass source)")
+        self.grp_out.Location = Point(PAD, PAD)
+        self.grp_out.Height = 68
+
+        lo = Label(); lo.Text = "File:"; lo.Location = Point(14,32); lo.Size = Size(40,22)
+        self.grp_out.Controls.Add(lo)
+        self.txt_out = TextBox()
+        self.txt_out.Location = Point(58, 29); self.txt_out.Size = Size(434, 24)
+        self.txt_out.Text = _reg_get("LastOutFile")
+        self.grp_out.Controls.Add(self.txt_out)
+        b1 = Button(); b1.Text = "..."; b1.Location = Point(498,28); b1.Size = Size(44,26)
+        b1.Click += self._browse_out; self.grp_out.Controls.Add(b1)
+
+        # 2) parcalar
+        self.grp_parts = self._mk_grp("2)  Bodies  (select individually or by Named Selection Group)")
+        self.grp_parts.Location = Point(PAD, 0)
+
+        # Grup secim satiri
+        lg = Label(); lg.Text = "NS Group:"; lg.Size = Size(72, 22)
+        self.grp_parts.Controls.Add(lg)
+        self.combo_group = ComboBox()
+        self.combo_group.Size = Size(280, 24)
+        self.combo_group.DropDownStyle = ComboBoxStyle.DropDownList
+        self.combo_group.Items.Add("-- Select group --")
+        for gname in sorted(self.ns_groups.keys()):
+            self.combo_group.Items.Add(gname)
+        self.combo_group.SelectedIndex = 0
+        _no_scroll_cmb(self.combo_group)
+        self.grp_parts.Controls.Add(self.combo_group)
+        self.btn_load_grp = Button()
+        self.btn_load_grp.Text = "Load Group"
+        self.btn_load_grp.Size = Size(100, 26)
+        self.btn_load_grp.Click += self._load_group
+        _style_btn(self.btn_load_grp, "run")
+        self.grp_parts.Controls.Add(self.btn_load_grp)
+
+        self.btn_addrow = Button()
+        self.btn_addrow.Text = "Add Row"
+        self.btn_addrow.Size = Size(80, 26)
+        self.btn_addrow.Click += self._on_add
+        _style_btn(self.btn_addrow)
+        self.grp_parts.Controls.Add(self.btn_addrow)
+
+        self._add_part_row()
+
+        # 3) esikler
+        self.grp_thr = self._mk_grp("3)  Thresholds")
+        self.grp_thr.Height = 122
+
+        lem = Label(); lem.Text = "Effective Mass Threshold (%):"
+        lem.Location = Point(14, 28); lem.Size = Size(200, 22)
+        self.grp_thr.Controls.Add(lem)
+        self.txt_em = TextBox()
+        self.txt_em.Location = Point(218, 25); self.txt_em.Size = Size(55, 24)
+        self.txt_em.Text = "5"
+        self.grp_thr.Controls.Add(self.txt_em)
+        lem2 = Label()
+        lem2.Text = "If X/Y/Z exceeds this -> compute strain energy"
+        lem2.Location = Point(285, 28); lem2.Size = Size(290, 22)
+        lem2.ForeColor = Color.DimGray
+        self.grp_thr.Controls.Add(lem2)
+
+        lse = Label(); lse.Text = "Strain Energy Threshold   (%):"
+        lse.Location = Point(14, 58); lse.Size = Size(200, 22)
+        self.grp_thr.Controls.Add(lse)
+        self.txt_se = TextBox()
+        self.txt_se.Location = Point(218, 55); self.txt_se.Size = Size(55, 24)
+        self.txt_se.Text = "10"
+        self.grp_thr.Controls.Add(self.txt_se)
+        lse2 = Label()
+        lse2.Text = "body/all_bodies ratio -> flag in report (**)"
+        lse2.Location = Point(285, 58); lse2.Size = Size(290, 22)
+        lse2.ForeColor = Color.DimGray
+        self.grp_thr.Controls.Add(lse2)
+
+        ltw = Label(); ltw.Text = "Twin Mode Tolerance       (Hz):"
+        ltw.Location = Point(14, 90); ltw.Size = Size(200, 22)
+        self.grp_thr.Controls.Add(ltw)
+        self.txt_twin = TextBox()
+        self.txt_twin.Location = Point(218, 87); self.txt_twin.Size = Size(55, 24)
+        self.txt_twin.Text = "2"
+        self.grp_thr.Controls.Add(self.txt_twin)
+        ltw2 = Label()
+        ltw2.Text = "Modes within this Hz -> twin, keep higher EM one"
+        ltw2.Location = Point(285, 90); ltw2.Size = Size(290, 22)
+        ltw2.ForeColor = Color.DimGray
+        self.grp_thr.Controls.Add(ltw2)
+
+        # 4) cikti
+        self.grp_exp = self._mk_grp("4)  Output Folder")
+        self.grp_exp.Height = 72
+
+        ldir = Label(); ldir.Text = "Folder:"; ldir.Location = Point(14,30); ldir.Size = Size(52,22)
+        self.grp_exp.Controls.Add(ldir)
+        self.txt_dir = TextBox()
+        self.txt_dir.Location = Point(68, 27); self.txt_dir.Size = Size(424, 24)
+        self.txt_dir.Text = _reg_get("LastDir")
+        self.grp_exp.Controls.Add(self.txt_dir)
+        b2 = Button(); b2.Text = "..."; b2.Location = Point(498,26); b2.Size = Size(44,26)
+        b2.Click += self._browse_dir; self.grp_exp.Controls.Add(b2)
+
+        lw = Label()
+        lw.Text = u"\u26A0  Ensure Output Controls > Volume and Energy = Yes before solving."
+        lw.Location = Point(14, 52); lw.Size = Size(540, 18)
+        lw.ForeColor = Color.Red
+        self.grp_exp.Controls.Add(lw)
+
+        # butonlar
+        self.btn_run = Button(); self.btn_run.Text = "Run"
+        self.btn_run.Size = Size(120, 36); self.btn_run.Font = FONT_TITLE
+        self.btn_run.Click += self._run
+        _style_btn(self.btn_run, "run")
+        self.Controls.Add(self.btn_run)
+        self.btn_cancel = Button(); self.btn_cancel.Text = "Cancel"
+        self.btn_cancel.Size = Size(100, 36)
+        self.btn_cancel.DialogResult = DialogResult.Cancel
+        _style_btn(self.btn_cancel)
+        self.Controls.Add(self.btn_cancel); self.CancelButton = self.btn_cancel
+
+        self._relayout()
+
+    # ---- grup yukleme ----
+    def _load_group(self, s, a):
+        if self.combo_group.SelectedIndex <= 0:
+            MessageBox.Show("Please select an NS Group first.", "Warning"); return
+        gname  = str(self.combo_group.SelectedItem)
+        ns_lst = self.ns_groups.get(gname, [])
+        if not ns_lst:
+            MessageBox.Show("Group '{0}' has no Named Selections.".format(gname), "Warning"); return
+        # Mevcut satirlari temizle
+        while self.part_rows:
+            row = self.part_rows.pop()
+            for c in row: self.grp_parts.Controls.Remove(c)
+        # Her NS icin satir ekle
+        for i, ns_name in enumerate(ns_lst):
+            self._add_part_row()
+            combo = self.part_rows[i][1]
+            # Combo'da bu ismi bul
+            for j in range(combo.Items.Count):
+                if str(combo.Items[j]) == ns_name:
+                    combo.SelectedIndex = j; break
+        if not self.part_rows: self._add_part_row()
+        self._relayout()
+
+    # ---- tekli satir ekleme/silme ----
+    def _add_part_row(self):
+        idx = len(self.part_rows)
+        lbl = Label(); lbl.Text = "Body {0}:".format(idx+1); lbl.Size = Size(68, 22)
+        self.grp_parts.Controls.Add(lbl)
+        combo = ComboBox(); combo.Size = Size(360, 24)
+        combo.DropDownStyle = ComboBoxStyle.DropDownList
+        combo.Items.Add("-- Select --")
+        for n in self.ns_names: combo.Items.Add(n)
+        combo.SelectedIndex = 0
+        _no_scroll_cmb(combo)
+        self.grp_parts.Controls.Add(combo)
+        br = Button(); br.Text = "-"; br.Size = Size(30, 24)
+        br.Enabled = True; br.Click += self._on_rem
+        _style_btn(br, "remove")
+        self.grp_parts.Controls.Add(br)
+        self.part_rows.append((lbl, combo, br))
+
+    def _on_add(self, s, a): self._add_part_row(); self._relayout()
+    def _on_rem(self, s, a):
+        if len(self.part_rows) <= 1: return
+        row = self.part_rows.pop()
+        for c in row: self.grp_parts.Controls.Remove(c)
+        self._relayout()
+
+    def _browse_out(self, s, a):
+        dlg = OpenFileDialog()
+        dlg.Filter = "Solve out (*.out)|*.out|All files (*.*)|*.*"
+        dlg.Title  = "Select MAPDL solve.out"
+        init = os.path.dirname(self.txt_out.Text) if self.txt_out.Text else ""
+        if init and os.path.exists(init): dlg.InitialDirectory = init
+        if dlg.ShowDialog() == DialogResult.OK:
+            self.txt_out.Text = dlg.FileName
+
+    def _browse_dir(self, s, a):
+        dlg = OpenFileDialog()
+        dlg.Title           = "Select output folder"
+        dlg.Filter          = "Folder|*.none"
+        dlg.CheckFileExists = False
+        dlg.CheckPathExists = True
+        dlg.ValidateNames   = False
+        dlg.FileName        = "Select folder"
+        if self.txt_dir.Text and os.path.exists(self.txt_dir.Text):
+            dlg.InitialDirectory = self.txt_dir.Text
+        if dlg.ShowDialog() == DialogResult.OK:
+            folder = os.path.dirname(dlg.FileName)
+            if not folder: folder = dlg.FileName
+            self.txt_dir.Text = folder
+
+    def _relayout(self):
+        self.grp_out.Location = Point(PAD, PAD)
+        yp = self.grp_out.Location.Y + self.grp_out.Height + PAD
+        self.grp_parts.Location = Point(PAD, yp)
+
+        # Grup secim satiri
+        lg = self.grp_parts.Controls[0]   # "NS Group:" label
+        lg.Location = Point(18, 25)
+        lg.Size     = Size(110, 22)
+        self.combo_group.Location = Point(132, 22)
+        self.combo_group.Size     = Size(220, 24)
+        self.btn_load_grp.Location  = Point(362, 20)
+        self.btn_addrow.Location    = Point(468, 20)
+
+        yrow = 54
+        for (lbl, combo, br) in self.part_rows:
+            lbl.Location   = Point(14,  yrow + 3)
+            combo.Location = Point(84,  yrow)
+            br.Location    = Point(454, yrow)
+            yrow += ROW_H
+        self.grp_parts.Height = yrow + 12
+
+        yt = self.grp_parts.Location.Y + self.grp_parts.Height + PAD
+        self.grp_thr.Location = Point(PAD, yt)
+        ye = yt + self.grp_thr.Height + PAD
+        self.grp_exp.Location = Point(PAD, ye)
+        yb = ye + self.grp_exp.Height + PAD + 6
+        self.btn_run.Location    = Point(GRP_W - 230 + PAD, yb)
+        self.btn_cancel.Location = Point(GRP_W - 100 + PAD, yb)
+        self.ClientSize = Size(GRP_W + 2*PAD, yb + 54)
+
+    def _run(self, s, a):
+        errs = []
+        of = self.txt_out.Text.strip()
+        if not of or not os.path.exists(of):
+            errs.append("Please select a valid solve.out file.")
+
+        sel = list(dict.fromkeys(
+            str(r[1].SelectedItem) for r in self.part_rows if r[1].SelectedIndex > 0))
+        if len(sel) < 1:
+            errs.append("Please select at least 1 body (Named Selection).")
+
+        try:
+            em = float(self.txt_em.Text.strip().replace(",",".")); assert 0<=em<=100
+        except:
+            errs.append("Effective mass threshold must be 0-100."); em = 5.0
+
+        try:
+            se = float(self.txt_se.Text.strip().replace(",",".")); assert 0<=se<=100
+        except:
+            errs.append("Strain energy threshold must be 0-100."); se = 10.0
+
+        try:
+            tw = float(self.txt_twin.Text.strip().replace(",",".")); assert tw >= 0
+        except:
+            errs.append("Twin mode tolerance must be >= 0 Hz."); tw = 2.0
+
+        od = self.txt_dir.Text.strip()
+        if not od: errs.append("Please select an output folder.")
+
+        if errs:
+            MessageBox.Show("Please fix:\n\n" + "\n".join(errs), "Warning"); return
+
+        self.parts    = sel
+        self.em_thr   = em
+        self.se_thr   = se
+        self.twin_hz  = tw
+        self.out_file = of; self.out_dir = od
+        _reg_set("LastOutFile", of); _reg_set("LastDir", od)
+        self.DialogResult = DialogResult.OK; self.Close()
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    global FONT_TITLE
+    _CANCEL[0] = False   # her calistirmada sifirla
+
+    model = ExtAPI.DataModel.Project.Model
+    base  = Form().Font
+    FONT_TITLE = Font(base, FontStyle.Bold)
+
+    analyses = list(model.Analyses)
+    modal    = [a for a in analyses if "modal" in str(a.AnalysisType).lower()]
+    cands    = modal if modal else analyses
+    if not cands:
+        MessageBox.Show("No analysis found.", "Error"); return
+
+    if len(cands) == 1:
+        analysis = cands[0]
+    else:
+        d = AnalysisSelectDialog(cands)
+        if d.ShowDialog() != DialogResult.OK: return
+        analysis = d.selected_analysis
+
+    # NS isimleri ve gruplar
+    ns_groups = get_ns_groups(model)
+    ns_names  = get_ns_names(model)
+    if not ns_names:
+        MessageBox.Show("At least 1 Named Selection is required.", "Error"); return
+
+    dlg = ModalIdDialog(ns_names, ns_groups)
+    if dlg.ShowDialog() != DialogResult.OK: return
+
+    # solve.out oku
+    try:
+        parsed = parse_out(dlg.out_file)
+    except Exception as ex:
+        MessageBox.Show("Failed to read solve.out:\n" + str(ex), "Error"); return
+    if not parsed:
+        MessageBox.Show("No participation factor table found in solve.out.", "Error"); return
+
+    print("HI blocks found:", [b["hi"] for b in parsed])
+
+    # Twin mod eliminasyonu
+    print("Twin elimination (tolerance: {0} Hz)...".format(dlg.twin_hz))
+    parsed_clean, twin_log = eliminate_twins(parsed, dlg.twin_hz)
+    total_twins = sum(len(twin_log[hi]) for hi in twin_log)
+    if total_twins > 0:
+        print("Total twins eliminated: {0}".format(total_twins))
+    else:
+        print("No twin modes found.")
+
+    selected = select_modes(parsed_clean, dlg.em_thr)
+    nsel = sum(len(selected[hi]) for hi in selected)
+    if nsel == 0:
+        MessageBox.Show(
+            "No modes exceed the effective mass threshold ({0:.1f}%).".format(dlg.em_thr),
+            "Info"); return
+
+    print("Selected modes (EM {0}%):".format(dlg.em_thr))
+    for hi in sorted(selected.keys()):
+        print("  HI {0}: modes {1}".format(hi, sorted(selected[hi].keys())))
+
+    # progress popup
+    import System
+    _t_start = System.DateTime.Now
+    prog = ProgressDialog()
+    prog.Show()
+    prog.update("Starting...", "{0} modes to process".format(nsel))
+
+    try:
+        energy = compute(analysis, dlg.parts, selected, prog)
+    except Exception as ex:
+        prog.Close()
+        MessageBox.Show("Computation error:\n" + str(ex), "Error"); return
+
+    if _CANCEL[0]:
+        prog.Close()
+        MessageBox.Show("Cancelled by user.", "Cancelled"); return
+
+    if energy is None:
+        prog.Close(); return
+
+    prog.update("Writing report...")
+    if not os.path.exists(dlg.out_dir): os.makedirs(dlg.out_dir)
+    txt_path = os.path.join(dlg.out_dir,
+        "ModalPartID_{0}.txt".format(sanitize(analysis.Name)))
+    write_txt(txt_path, dlg.parts, dlg.em_thr, dlg.se_thr, dlg.twin_hz,
+              parsed_clean, twin_log, selected, energy)
+
+    prog.done(); prog.Close()
+
+    # Sure hesapla
+    _t_end     = System.DateTime.Now
+    _elapsed   = int((_t_end - _t_start).TotalSeconds)
+    if _elapsed < 60:
+        _dur_str = "{0} sec".format(_elapsed)
+    else:
+        _dur_str = "{0} min {1} sec".format(_elapsed // 60, _elapsed % 60)
+
+    # ozet popup
+    lines = ["Done.  {0} modes processed.\n".format(nsel)]
+    for hi in sorted(energy.keys()):
+        lines.append("HI {0}:".format(hi))
+        for mode in sorted(energy[hi].keys()):
+            ratios = energy[hi][mode]["ratio"]
+            best   = max(dlg.parts, key=lambda p: ratios[p]) if dlg.parts else "-"
+            flag   = "**" if any(ratios[p] >= dlg.se_thr for p in dlg.parts) else "  "
+            lines.append("{0}  Mode {1}  f={2:.0f}Hz -> {3} ({4:.1f}%)".format(
+                flag, mode, selected[hi][mode]["freq"], best, ratios[best]))
+    if len(lines) > 45: lines = lines[:45] + ["... (see report)"]
+    msg  = "\n".join(lines)
+    msg += "\n\nReport: " + txt_path
+    msg += "\nDuration: " + _dur_str
+    MessageBox.Show(msg, "Modal Part Identifier - Summary")
+
+main()
