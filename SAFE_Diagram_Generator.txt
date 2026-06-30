@@ -1,0 +1,1142 @@
+# -*- coding: utf-8 -*-
+"""
+SAFE Diagram Generator - IronPython / Ansys Mechanical
+--------------------------------------------------------------------------------
+Bu script, Mechanical'in Script konsolunda calistirilir. Cyclic symmetry modal
+sonuclarini (solve.out) otomatik bulup parse eder, kullanicidan Blade Count,
+Sector, Max Harmonic Index, Idle/RL RPM, Margin (%) ve Critical Engine
+Order'lari alir ve bunlardan bir SAFE (Singh's Advanced Frequency Evaluation)
+diyagrami ureten 2 sayfali bir .xlsx dosyasi olusturur.
+
+GUNCELLEME: Critical Engine Orders artik virgulle ayrilmis metin yerine,
+split-panel bir secim penceresinden (EOPickerDialog) seciliyor -- StepPickerDialog
+ile ayni mantik: 1..200 arasi hazir liste, coklu secip Add>/<Remove ile tasima.
+"""
+import clr
+clr.AddReference("System.IO.Compression")
+clr.AddReference("System.IO.Compression.FileSystem")
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+import os, re, math
+from System.IO import FileStream, FileMode
+from System.IO.Compression import ZipArchive, ZipArchiveMode, CompressionLevel
+from System.Text import UTF8Encoding
+from System.Windows.Forms import (
+    Form, Label, Button, TextBox, SaveFileDialog, FlatStyle,
+    DialogResult, FormStartPosition, FormBorderStyle, MessageBox, GroupBox,
+    ListBox, SelectionMode
+)
+from System.Drawing import Size, Point, Font, FontStyle, Color
+from Microsoft.Win32 import Registry
+
+# =====================================================================
+# REGISTRY HELPERS - remember only the last save folder between runs
+# =====================================================================
+REG_KEY = r"Software\SafeDiagramKelly"
+
+def reg_get(name, default=""):
+    try:
+        key = Registry.CurrentUser.OpenSubKey(REG_KEY)
+        if key is None:
+            return default
+        val = key.GetValue(name)
+        return val if val else default
+    except Exception:
+        return default
+
+def reg_set(name, value):
+    try:
+        key = Registry.CurrentUser.CreateSubKey(REG_KEY)
+        key.SetValue(name, value)
+    except Exception:
+        pass
+
+# =====================================================================
+# SMALL HELPERS
+# =====================================================================
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def col_letter(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def cellref(row, col):
+    return "%s%d" % (col_letter(col), row)
+
+def fold(eo, h2):
+    """Folds an engine order onto the [0, h2] Nodal-Diameter axis
+    (triangular wave, period 2*h2) - exact 'POINTS' logic."""
+    period = 2.0 * h2
+    m = eo % period
+    if m > h2:
+        return period - m
+    return m
+
+# =====================================================================
+# 1) .OUT PARSER  (cyclic symmetry modal results, per Harmonic Index)
+# =====================================================================
+def parse_out_all(path):
+    with open(path, "r") as f:
+        lines = f.readlines()
+    results = {}
+    cur_hi = None
+
+    def detect_dir(line):
+        u = line.upper()
+        if "PARTICIPATION FACTOR CALCULATION" not in u:
+            return None
+        tail = u.split("*****")[-1]
+        for d in ["ROTX", "ROTY", "ROTZ"]:
+            if d in tail:
+                return d
+        m = re.search(r"\b([XYZ])\s+DIRECTION", tail)
+        if m:
+            return m.group(1)
+        return None
+
+    i = 0
+    while i < len(lines):
+        u = lines[i].upper()
+        m = re.search(r"CYCLIC SYMMETRY HARMONIC INDEX\s*[.\s]*(\d+)", u)
+        if m:
+            cur_hi = int(m.group(1))
+            results.setdefault(cur_hi, {})
+            i += 1
+            continue
+        d = detect_dir(lines[i])
+        if d is not None:
+            if cur_hi is None:
+                cur_hi = 0
+            results.setdefault(cur_hi, {})
+            j = i + 1
+            while j < len(lines):
+                if "MODE" in lines[j].upper() and "FREQUENCY" in lines[j].upper():
+                    j += 1
+                    break
+                j += 1
+            while j < len(lines):
+                lj = lines[j].strip()
+                if not lj:
+                    j += 1
+                    continue
+                if lj.startswith("---") or lj.lower().startswith("sum"):
+                    break
+                parts = lj.split()
+                try:
+                    mode = int(parts[0])
+                    freq = float(parts[1])
+                    if mode not in results[cur_hi]:
+                        results[cur_hi][mode] = freq
+                except Exception:
+                    break
+                j += 1
+            i = j
+            continue
+        i += 1
+
+    out = {}
+    for hi in sorted(results.keys()):
+        out[hi] = [(m, results[hi][m]) for m in sorted(results[hi].keys())]
+    return out
+
+def eliminate_twins(modes_by_hi, twin_hz=1.0):
+    out = {}
+    for hi in sorted(modes_by_hi.keys()):
+        pairs = sorted(modes_by_hi[hi], key=lambda p: p[1])
+        kept = []
+        i = 0
+        while i < len(pairs):
+            if i + 1 < len(pairs) and abs(pairs[i+1][1] - pairs[i][1]) <= twin_hz:
+                kept.append(pairs[i])
+                i += 2
+            else:
+                kept.append(pairs[i])
+                i += 1
+        out[hi] = kept
+    return out
+
+# =====================================================================
+# 2) AUTO-DETECT .OUT FROM MECHANICAL TREE
+# =====================================================================
+def find_out_file():
+    try:
+        model = ExtAPI.DataModel.Project.Model
+        analyses = list(model.Analyses)
+    except Exception:
+        return None, "Could not access ExtAPI.DataModel.Project.Model."
+    if not analyses:
+        return None, "No analysis found in the Mechanical tree."
+    modal = [a for a in analyses if "modal" in str(a.AnalysisType).lower()]
+    candidates = modal if modal else analyses
+    for a in candidates:
+        try:
+            working_dir = a.WorkingDir
+        except Exception:
+            continue
+        if not working_dir:
+            continue
+        candidate_path = os.path.join(working_dir, "solve.out")
+        if os.path.exists(candidate_path):
+            return candidate_path, None
+    return None, "Could not find solve.out in any modal analysis working directory."
+
+# =====================================================================
+# 3) EO PICKER DIALOG  (StepPickerDialog mantigi, 1..200 split-panel)
+# =====================================================================
+class EOPickerDialog(Form):
+    """Split-panel Engine Order selector. 1..200 arasi sayilari listeler."""
+    def __init__(self, preselected=None, max_eo=200):
+        self.selected_eos = list(preselected) if preselected is not None else []
+        self._max_eo = max_eo
+
+        self.Text            = "Select Critical Engine Orders"
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox     = False
+        self.MinimizeBox     = False
+        self.ClientSize      = Size(500, 420)
+
+        lbl_left = Label()
+        lbl_left.Text     = "Available Engine Orders"
+        lbl_left.Location = Point(15, 12)
+        lbl_left.Size     = Size(180, 20)
+        lbl_left.Font     = Font(self.Font, FontStyle.Bold)
+        self.Controls.Add(lbl_left)
+
+        self.lst_avail = ListBox()
+        self.lst_avail.Location      = Point(15, 35)
+        self.lst_avail.Size          = Size(180, 320)
+        self.lst_avail.SelectionMode = SelectionMode.MultiExtended
+        self.Controls.Add(self.lst_avail)
+
+        btn_add = Button()
+        btn_add.Text      = "Add >"
+        btn_add.Location  = Point(210, 150)
+        btn_add.Size      = Size(80, 32)
+        btn_add.ForeColor = Color.FromArgb(0, 100, 200)
+        btn_add.Click    += self._on_add
+        self.Controls.Add(btn_add)
+
+        btn_del = Button()
+        btn_del.Text      = "< Remove"
+        btn_del.Location  = Point(210, 192)
+        btn_del.Size      = Size(80, 32)
+        btn_del.ForeColor = Color.FromArgb(200, 0, 0)
+        btn_del.Click    += self._on_del
+        self.Controls.Add(btn_del)
+
+        lbl_right = Label()
+        lbl_right.Text     = "Selected Engine Orders"
+        lbl_right.Location = Point(305, 12)
+        lbl_right.Size     = Size(180, 20)
+        lbl_right.Font     = Font(self.Font, FontStyle.Bold)
+        self.Controls.Add(lbl_right)
+
+        self.lst_sel = ListBox()
+        self.lst_sel.Location      = Point(305, 35)
+        self.lst_sel.Size          = Size(180, 320)
+        self.lst_sel.SelectionMode = SelectionMode.MultiExtended
+        self.Controls.Add(self.lst_sel)
+
+        btn_ok = Button()
+        btn_ok.Text     = "OK"
+        btn_ok.Location = Point(305, 368)
+        btn_ok.Size     = Size(80, 30)
+        btn_ok.Click   += self._on_ok
+        self.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text         = "Cancel"
+        btn_cancel.Location     = Point(395, 368)
+        btn_cancel.Size         = Size(90, 30)
+        btn_cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(btn_cancel)
+        self.CancelButton = btn_cancel
+
+        self._populate()
+
+    def _populate(self):
+        sel_set = set(self.selected_eos)
+        self.lst_avail.Items.Clear()
+        self.lst_sel.Items.Clear()
+        for eo in range(1, self._max_eo + 1):
+            if eo not in sel_set:
+                self.lst_avail.Items.Add(str(eo))
+        for eo in sorted(sel_set):
+            self.lst_sel.Items.Add(str(eo))
+
+    def _parse_eo(self, item_str):
+        return int(str(item_str).strip())
+
+    def _on_add(self, sender, args):
+        to_add = [self._parse_eo(self.lst_avail.Items[i])
+                  for i in range(self.lst_avail.Items.Count)
+                  if self.lst_avail.GetSelected(i)]
+        for eo in to_add:
+            if eo not in self.selected_eos:
+                self.selected_eos.append(eo)
+        self.selected_eos.sort()
+        self._populate()
+
+    def _on_del(self, sender, args):
+        to_del = set(self._parse_eo(self.lst_sel.Items[i])
+                     for i in range(self.lst_sel.Items.Count)
+                     if self.lst_sel.GetSelected(i))
+        self.selected_eos = [eo for eo in self.selected_eos if eo not in to_del]
+        self._populate()
+
+    def _on_ok(self, sender, args):
+        if not self.selected_eos:
+            MessageBox.Show("Please select at least one Engine Order.", "Warning")
+            return
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+# =====================================================================
+# 4) POPUP
+# =====================================================================
+FONT_TITLE = None
+PAD = 14
+GRP_W = 600
+
+class SafeDialog(Form):
+    def __init__(self):
+        self.blade_count = 0
+        self.sector = 0
+        self.max_hi = 0
+        self.idle_rpm = 0.
+        self.rl_rpm = 0.
+        self.margin_pct = 0.
+        self.critical_eos = []
+        self.out_path = ""
+        self._eo_list = []   # secilen Critical Engine Order'lar (int liste)
+
+        self.Text = "SAFE Diagram Generator"
+        self.Font = FONT_TITLE
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self._build()
+
+    def _mk_grp(self, title, h):
+        g = GroupBox(); g.Text = title; g.Font = FONT_TITLE
+        g.Width = GRP_W; g.Height = h
+        self.Controls.Add(g)
+        return g
+
+    def _build(self):
+        # --- Group 1: Cyclic Symmetry ---
+        self.grp_cyc = self._mk_grp("1)  Cyclic Symmetry  (Blade Count / Sector / Max Harmonic Index)", 62)
+        lb = Label(); lb.Text = "Blade Count:"; lb.Location = Point(14, 28); lb.Size = Size(86, 22)
+        self.grp_cyc.Controls.Add(lb)
+        self.txt_blade = TextBox()
+        self.txt_blade.Location = Point(102, 25); self.txt_blade.Size = Size(60, 24)
+        self.txt_blade.TextChanged += self._auto_calc_maxhi
+        self.grp_cyc.Controls.Add(self.txt_blade)
+
+        ls = Label(); ls.Text = "Sector:"; ls.Location = Point(180, 28); ls.Size = Size(50, 22)
+        self.grp_cyc.Controls.Add(ls)
+        self.txt_sector = TextBox()
+        self.txt_sector.Location = Point(232, 25); self.txt_sector.Size = Size(50, 24)
+        self.txt_sector.TextChanged += self._auto_calc_maxhi
+        self.grp_cyc.Controls.Add(self.txt_sector)
+
+        lh = Label(); lh.Text = "Max Harmonic Index:"; lh.Location = Point(300, 28); lh.Size = Size(132, 22)
+        self.grp_cyc.Controls.Add(lh)
+        self.txt_maxhi = TextBox()
+        self.txt_maxhi.Location = Point(436, 25); self.txt_maxhi.Size = Size(60, 24)
+        self.grp_cyc.Controls.Add(self.txt_maxhi)
+
+        # --- Group 2: Operating Speed & Margin ---
+        self.grp_rpm = self._mk_grp("2)  Operating Speed & Margin", 62)
+        lr1 = Label(); lr1.Text = "Idle RPM:"; lr1.Location = Point(14, 28); lr1.Size = Size(64, 22)
+        self.grp_rpm.Controls.Add(lr1)
+        self.txt_idle = TextBox()
+        self.txt_idle.Location = Point(80, 25); self.txt_idle.Size = Size(90, 24)
+        self.grp_rpm.Controls.Add(self.txt_idle)
+
+        lr2 = Label(); lr2.Text = "RL RPM:"; lr2.Location = Point(184, 28); lr2.Size = Size(56, 22)
+        self.grp_rpm.Controls.Add(lr2)
+        self.txt_rl = TextBox()
+        self.txt_rl.Location = Point(242, 25); self.txt_rl.Size = Size(90, 24)
+        self.grp_rpm.Controls.Add(self.txt_rl)
+
+        lr3 = Label(); lr3.Text = "Margin (%):"; lr3.Location = Point(346, 28); lr3.Size = Size(76, 22)
+        self.grp_rpm.Controls.Add(lr3)
+        self.txt_margin = TextBox()
+        self.txt_margin.Location = Point(424, 25); self.txt_margin.Size = Size(70, 24)
+        self.grp_rpm.Controls.Add(self.txt_margin)
+
+        # --- Group 3: Critical Engine Orders (picker dialog ile) ---
+        self.grp_eo = self._mk_grp("3)  Critical Engine Orders", 62)
+        leo = Label(); leo.Text = "Selected:"; leo.Location = Point(14, 28); leo.Size = Size(70, 22)
+        self.grp_eo.Controls.Add(leo)
+
+        self.lbl_eo_summary = Label()
+        self.lbl_eo_summary.Text      = "(none selected)"
+        self.lbl_eo_summary.Location  = Point(90, 28)
+        self.lbl_eo_summary.Size      = Size(330, 22)
+        self.lbl_eo_summary.ForeColor = Color.DimGray
+        self.lbl_eo_summary.AutoEllipsis = True
+        self.grp_eo.Controls.Add(self.lbl_eo_summary)
+
+        self.btn_eo_pick = Button()
+        self.btn_eo_pick.Text      = "Select Engine Orders..."
+        self.btn_eo_pick.Location  = Point(430, 25)
+        self.btn_eo_pick.Size      = Size(152, 28)
+        self.btn_eo_pick.FlatStyle = FlatStyle.Flat
+        self.btn_eo_pick.BackColor = Color.FromArgb(0, 112, 192)
+        self.btn_eo_pick.ForeColor = Color.White
+        self.btn_eo_pick.Click    += self._on_eo_pick
+        self.grp_eo.Controls.Add(self.btn_eo_pick)
+
+        # --- Group 4: Excel Save Location ---
+        self.grp_sv = self._mk_grp("4)  Excel Save Location", 68)
+        lsv = Label(); lsv.Text = "Save to:"; lsv.Location = Point(14, 32); lsv.Size = Size(60, 22)
+        self.grp_sv.Controls.Add(lsv)
+        self.txt_sv = TextBox()
+        self.txt_sv.Location = Point(76, 29); self.txt_sv.Size = Size(438, 24)
+        last_dir = reg_get("LastSaveDir", "")
+        if last_dir and os.path.exists(last_dir):
+            self.txt_sv.Text = os.path.join(last_dir, "SAFE_Diagram.xlsx")
+        self.grp_sv.Controls.Add(self.txt_sv)
+        b2 = Button(); b2.Text = "..."; b2.Location = Point(520, 28); b2.Size = Size(44, 26)
+        b2.Click += self._browse_save
+        self.grp_sv.Controls.Add(b2)
+
+        self.btn_run = Button()
+        self.btn_run.Text = "Generate"
+        self.btn_run.Size = Size(120, 36)
+        self.btn_run.Font = FONT_TITLE
+        self.btn_run.FlatStyle = FlatStyle.Flat
+        self.btn_run.BackColor = Color.FromArgb(0, 112, 192)
+        self.btn_run.ForeColor = Color.White
+        self.btn_run.FlatAppearance.BorderSize = 0
+        self.btn_run.Click += self._run
+        self.Controls.Add(self.btn_run)
+
+        self.btn_cancel = Button()
+        self.btn_cancel.Text = "Cancel"
+        self.btn_cancel.Size = Size(100, 36)
+        self.btn_cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(self.btn_cancel)
+        self.CancelButton = self.btn_cancel
+
+        self._relayout()
+
+    def _relayout(self):
+        y = PAD
+        for grp in [self.grp_cyc, self.grp_rpm, self.grp_eo, self.grp_sv]:
+            grp.Location = Point(PAD, y)
+            y += grp.Height + PAD
+        self.btn_run.Location = Point(GRP_W - 250 + PAD, y + 4)
+        self.btn_cancel.Location = Point(GRP_W - 100 + PAD, y + 4)
+        self.ClientSize = Size(GRP_W + 2*PAD, y + 56)
+
+    def _auto_calc_maxhi(self, s, a):
+        # Live suggestion only - the user can still overwrite this field.
+        try:
+            b = int(self.txt_blade.Text.strip())
+            sec = int(self.txt_sector.Text.strip())
+            if b > 0 and sec > 0:
+                self.txt_maxhi.Text = str(int((float(b) / sec) / 2.0))
+        except Exception:
+            pass
+
+    def _on_eo_pick(self, sender, args):
+        dlg = EOPickerDialog(preselected=self._eo_list, max_eo=200)
+        if dlg.ShowDialog() == DialogResult.OK:
+            self._eo_list = sorted(dlg.selected_eos)
+            if not self._eo_list:
+                self.lbl_eo_summary.Text = "(none selected)"
+            else:
+                self.lbl_eo_summary.Text = ", ".join(str(e) for e in self._eo_list)
+
+    def _browse_save(self, s, a):
+        dlg = SaveFileDialog()
+        dlg.Title = "Save SAFE Diagram"
+        dlg.Filter = "Excel Workbook (*.xlsx)|*.xlsx"
+        dlg.FileName = "SAFE_Diagram.xlsx"
+        last_dir = reg_get("LastSaveDir", "")
+        if last_dir and os.path.exists(last_dir):
+            dlg.InitialDirectory = last_dir
+        else:
+            tmp = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Temp"
+            if os.path.exists(tmp):
+                dlg.InitialDirectory = tmp
+        if dlg.ShowDialog() == DialogResult.OK:
+            self.txt_sv.Text = dlg.FileName
+            reg_set("LastSaveDir", os.path.dirname(dlg.FileName))
+
+    def _run(self, s, a):
+        errs = []
+        try:
+            blade_val = int(self.txt_blade.Text.strip())
+            assert blade_val > 0
+        except Exception:
+            errs.append("Blade count must be a positive integer.")
+            blade_val = 0
+        try:
+            sector_val = int(self.txt_sector.Text.strip())
+            assert sector_val > 0
+        except Exception:
+            errs.append("Sector must be a positive integer.")
+            sector_val = 0
+        try:
+            maxhi_val = int(self.txt_maxhi.Text.strip())
+            assert maxhi_val > 0
+        except Exception:
+            errs.append("Max Harmonic Index must be a positive integer.")
+            maxhi_val = 0
+        try:
+            idle_val = float(self.txt_idle.Text.strip().replace(",", "."))
+            assert idle_val > 0
+        except Exception:
+            errs.append("Idle RPM must be a positive number.")
+            idle_val = 0.
+        try:
+            rl_val = float(self.txt_rl.Text.strip().replace(",", "."))
+            assert rl_val > 0
+        except Exception:
+            errs.append("RL RPM must be a positive number.")
+            rl_val = 0.
+        try:
+            margin_val = float(self.txt_margin.Text.strip().replace(",", "."))
+            assert 0 < margin_val <= 100
+        except Exception:
+            errs.append("Margin must be a number between 0 and 100.")
+            margin_val = 0.
+
+        eo_list = list(self._eo_list)
+        if not eo_list:
+            errs.append("Please select at least one Critical Engine Order.")
+
+        sv = self.txt_sv.Text.strip()
+        if not sv:
+            errs.append("Please choose where to save the Excel file.")
+        if errs:
+            MessageBox.Show("Please fix the following:\n\n" + "\n".join(errs), "Warning")
+            return
+        self.blade_count = blade_val
+        self.sector = sector_val
+        self.max_hi = maxhi_val
+        self.idle_rpm = idle_val
+        self.rl_rpm = rl_val
+        self.margin_pct = margin_val
+        self.critical_eos = sorted(eo_list)
+        self.out_path = sv
+        reg_set("LastSaveDir", os.path.dirname(sv))
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+def main():
+    global FONT_TITLE, BLADE_COUNT, SECTOR, MAX_HI, IDLE_RPM, RL_RPM
+    global MARGIN_PCT, CRITICAL_EOS, MODES_BY_HI, OUT_PATH
+    base = Form().Font
+    FONT_TITLE = Font(base, FontStyle.Bold)
+
+    out_file, err = find_out_file()
+    if not out_file:
+        MessageBox.Show("Could not locate solve.out automatically.\n\n" + str(err), "Error")
+        return None
+
+    dlg = SafeDialog()
+    if dlg.ShowDialog() != DialogResult.OK:
+        return None
+
+    try:
+        modes_by_hi = parse_out_all(out_file)
+    except Exception as ex:
+        MessageBox.Show("Could not read solve.out:\n" + str(ex), "Error")
+        return None
+
+    if not modes_by_hi:
+        MessageBox.Show("No cyclic symmetry modal data found in solve.out.", "Information")
+        return None
+
+    modes_by_hi = eliminate_twins(modes_by_hi, twin_hz=1.0)
+
+    BLADE_COUNT = dlg.blade_count
+    SECTOR = dlg.sector
+    MAX_HI = dlg.max_hi
+    IDLE_RPM = dlg.idle_rpm
+    RL_RPM = dlg.rl_rpm
+    MARGIN_PCT = dlg.margin_pct
+    CRITICAL_EOS = dlg.critical_eos
+    MODES_BY_HI = modes_by_hi
+    OUT_PATH = dlg.out_path
+    return True
+
+_MAIN_OK = main()
+
+if _MAIN_OK:
+    H2 = float(MAX_HI)
+    MARGIN_FRAC = MARGIN_PCT / 100.
+    IDLE_MARGIN_RPM = IDLE_RPM * (1. - MARGIN_FRAC)
+    RL_MARGIN_RPM = RL_RPM * (1. + MARGIN_FRAC)
+
+    eo_info = []
+    for eo in CRITICAL_EOS:
+        nd = fold(float(eo), H2)
+        t = eo * IDLE_MARGIN_RPM / 60.
+        u = eo * RL_MARGIN_RPM / 60.
+        eo_info.append((eo, nd, t, u))
+
+    max_eo = max(CRITICAL_EOS)
+    N_ZZ = max(6, int(math.ceil(max_eo / H2)) + 1)
+
+    def build_zigzag(rpm):
+        pts = [(0., 0.)]
+        for n in range(1, N_ZZ + 1):
+            nd = 0. if (n % 2 == 0) else H2
+            f = n * H2 * rpm / 60.
+            pts.append((nd, f))
+        return pts
+
+    ZZ_IDLE = build_zigzag(IDLE_RPM)
+    ZZ_RL = build_zigzag(RL_RPM)
+    ZZ_IDLE_MARGIN = build_zigzag(IDLE_MARGIN_RPM)
+    ZZ_RL_MARGIN = build_zigzag(RL_MARGIN_RPM)
+
+    def crossing_eos_for(hi, freq):
+        matches = []
+        for (eo, nd, t, u) in eo_info:
+            if abs(float(hi) - nd) > 0.5:
+                continue
+            lo, hif = (t, u) if t <= u else (u, t)
+            if lo <= freq <= hif:
+                matches.append(eo)
+        return matches
+
+    HI_LIST = sorted(MODES_BY_HI.keys())
+    mode_points = []
+    crossing_points = []
+    crossing_details = []
+    all_mode_freqs = []
+    for hi in HI_LIST:
+        for (mode_no, freq) in MODES_BY_HI[hi]:
+            all_mode_freqs.append(freq)
+            matches = crossing_eos_for(hi, freq)
+            if matches:
+                crossing_points.append((hi, mode_no, freq))
+                crossing_details.append((hi, mode_no, freq, matches))
+            else:
+                mode_points.append((hi, mode_no, freq))
+
+    MODE_MAX_FREQ = max(all_mode_freqs) if all_mode_freqs else 1000.
+    AXIS_MAX_FREQ = MODE_MAX_FREQ + 2000.
+    AXIS_MAX_ND = H2 + 1.
+
+CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+<Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+</Types>"""
+
+ROOT_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+
+WORKBOOK_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<bookViews><workbookView activeTab="1"/></bookViews>
+<sheets><sheet name="Inputs" sheetId="1" r:id="rId1"/><sheet name="SAFE Diagram" sheetId="2" r:id="rId2"/></sheets>
+</workbook>"""
+
+WORKBOOK_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
+</Relationships>"""
+
+STYLES_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<numFmts count="1">
+<numFmt numFmtId="164" formatCode="General"/>
+</numFmts>
+<fonts count="4">
+<font><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/><charset val="1"/></font>
+<font><b val="true"/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Arial"/><family val="0"/><charset val="1"/></font>
+<font><sz val="11"/><color rgb="FF0000FF"/><name val="Arial"/><family val="0"/><charset val="1"/></font>
+<font><b val="true"/><sz val="11"/><color rgb="FF000000"/><name val="Arial"/><family val="0"/><charset val="1"/></font>
+</fonts>
+<fills count="4">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF404040"/><bgColor rgb="FF404040"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor rgb="FFFFFF00"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFED7D31"/><bgColor rgb="FFED7D31"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border diagonalUp="false" diagonalDown="false"><left/><right/><top/><bottom/><diagonal/></border>
+<border diagonalUp="false" diagonalDown="false"><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right><top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border>
+</borders>
+<cellStyleXfs count="1">
+<xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyFont="true" applyBorder="true" applyAlignment="true" applyProtection="true">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+</cellStyleXfs>
+<cellXfs count="5">
+<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyFont="false" applyBorder="false" applyAlignment="false" applyProtection="false">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+<xf numFmtId="164" fontId="1" fillId="1" borderId="1" xfId="0" applyFont="true" applyFill="true" applyBorder="true" applyAlignment="false" applyProtection="false">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+<xf numFmtId="164" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="true" applyFill="true" applyBorder="true" applyAlignment="false" applyProtection="false">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+<xf numFmtId="164" fontId="1" fillId="3" borderId="1" xfId="0" applyFont="true" applyFill="true" applyBorder="true" applyAlignment="false" applyProtection="false">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+<xf numFmtId="164" fontId="3" fillId="0" borderId="1" xfId="0" applyFont="true" applyBorder="true" applyAlignment="false" applyProtection="false">
+<alignment horizontal="general" vertical="bottom" textRotation="0" wrapText="false" indent="0" shrinkToFit="false"/>
+<protection locked="true" hidden="false"/>
+</xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>"""
+
+S_DEFAULT = 0
+S_HEADER = 1
+S_INPUT = 2
+S_HEADER_EO = 3
+S_LABEL = 4
+
+THEME_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+<a:themeElements>
+<a:clrScheme name="Office">
+<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="44546A"/></a:dk2>
+<a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+<a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+<a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+<a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+<a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+<a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+</a:clrScheme>
+<a:fontScheme name="Office">
+<a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>
+</a:fontScheme>
+<a:fmtScheme name="Office">
+<a:fillStyleLst>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+</a:fillStyleLst>
+<a:lnStyleLst>
+<a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+<a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>
+</a:lnStyleLst>
+<a:effectStyleLst>
+<a:effectStyle><a:effectLst/></a:effectStyle>
+<a:effectStyle><a:effectLst/></a:effectStyle>
+<a:effectStyle><a:effectLst/></a:effectStyle>
+</a:effectStyleLst>
+<a:bgFillStyleLst>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+</a:bgFillStyleLst>
+</a:fmtScheme>
+</a:themeElements>
+</a:theme>"""
+
+SHEET2_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>"""
+
+DRAWING_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<xdr:twoCellAnchor>
+<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+<xdr:to><xdr:col>14</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>30</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+<xdr:graphicFrame macro="">
+<xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>
+<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>
+<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId1"/>
+</a:graphicData></a:graphic>
+</xdr:graphicFrame>
+<xdr:clientData/>
+</xdr:twoCellAnchor>
+</xdr:wsDr>"""
+
+DRAWING_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>
+</Relationships>"""
+
+def build_inputs_sheet_xml():
+    def c_txt(r, c, text, style=S_DEFAULT):
+        return '<c r="%s" s="%d" t="inlineStr"><is><t>%s</t></is></c>' % (cellref(r, c), style, esc(text))
+    def c_num(r, c, v, style=S_DEFAULT):
+        return '<c r="%s" s="%d"><v>%s</v></c>' % (cellref(r, c), style, v)
+
+    rows = {}
+    def put(r, c, xml):
+        rows.setdefault(r, {})[c] = xml
+
+    put(1, 1, c_txt(1, 1, "Blade Count", S_HEADER))
+    put(1, 2, c_txt(1, 2, "Sector (blades/sector)", S_HEADER))
+    put(1, 3, c_txt(1, 3, "Max Harmonic Index", S_HEADER))
+    put(2, 1, c_num(2, 1, BLADE_COUNT, S_INPUT))
+    put(2, 2, c_num(2, 2, SECTOR, S_INPUT))
+    put(2, 3, c_num(2, 3, MAX_HI, S_INPUT))
+
+    put(4, 1, c_txt(4, 1, "Engine Inputs", S_HEADER))
+    put(4, 2, c_txt(4, 2, "", S_HEADER))
+    put(5, 1, c_txt(5, 1, "Idle RPM", S_LABEL))
+    put(5, 2, c_num(5, 2, IDLE_RPM, S_INPUT))
+    put(6, 1, c_txt(6, 1, "RL RPM", S_LABEL))
+    put(6, 2, c_num(6, 2, RL_RPM, S_INPUT))
+    put(7, 1, c_txt(7, 1, "Margin (%)", S_LABEL))
+    put(7, 2, c_num(7, 2, MARGIN_PCT, S_INPUT))
+
+    put(9, 1, c_txt(9, 1, "Critical Engine Orders", S_HEADER_EO))
+    r = 10
+    for eo in CRITICAL_EOS:
+        put(r, 1, c_num(r, 1, eo, S_INPUT))
+        r += 1
+    last_row = r - 1
+
+    rows_xml = []
+    for r in sorted(rows.keys()):
+        cells = rows[r]
+        parts = [cells[c] for c in sorted(cells.keys())]
+        rows_xml.append('<row r="%d">%s</row>' % (r, "".join(parts)))
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<dimension ref="A1:C%d"/>'
+        '<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        '<cols><col min="1" max="1" width="22" customWidth="1"/>'
+        '<col min="2" max="2" width="24" customWidth="1"/>'
+        '<col min="3" max="3" width="20" customWidth="1"/></cols>'
+        '<sheetData>%s</sheetData>'
+        '<mergeCells count="1"><mergeCell ref="A4:B4"/></mergeCells>'
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '</worksheet>'
+    ) % (last_row, "".join(rows_xml))
+    return sheet_xml
+
+def build_diagram_sheet_xml():
+    C_ZZ_IDLE_ND, C_ZZ_IDLE_F = 1, 2
+    C_ZZ_RL_ND, C_ZZ_RL_F = 3, 4
+    C_ZZ_IMG_ND, C_ZZ_IMG_F = 5, 6
+    C_ZZ_RMG_ND, C_ZZ_RMG_F = 7, 8
+    C_EO_START = 9
+    n_eo = len(eo_info)
+    C_MODND = C_EO_START + 2 * n_eo
+    C_MODHZ = C_MODND + 1
+    C_CRND = C_MODHZ + 1
+    C_CRHZ = C_CRND + 1
+    C_SUMMARY = max(C_CRHZ + 2, 16)
+
+    cells_by_row = {}
+    text_cells_by_row = {}
+    def setv(r, c, v):
+        cells_by_row.setdefault(r, {})[c] = v
+    def settxt(r, c, text):
+        text_cells_by_row.setdefault(r, {})[c] = text
+
+    def write_series(col_nd, col_f, pts):
+        for i, (nd, f) in enumerate(pts):
+            r = i + 1
+            setv(r, col_nd, nd)
+            setv(r, col_f, f)
+
+    write_series(C_ZZ_IDLE_ND, C_ZZ_IDLE_F, ZZ_IDLE)
+    write_series(C_ZZ_RL_ND, C_ZZ_RL_F, ZZ_RL)
+    write_series(C_ZZ_IMG_ND, C_ZZ_IMG_F, ZZ_IDLE_MARGIN)
+    write_series(C_ZZ_RMG_ND, C_ZZ_RMG_F, ZZ_RL_MARGIN)
+
+    eo_cols = []
+    for i, (eo, nd, t, u) in enumerate(eo_info):
+        col_nd = C_EO_START + 2 * i
+        col_f = col_nd + 1
+        setv(1, col_nd, nd); setv(1, col_f, t)
+        setv(2, col_nd, nd); setv(2, col_f, u)
+        eo_cols.append((eo, col_nd, col_f))
+
+    for i, (hi, mode_no, freq) in enumerate(mode_points):
+        r = i + 1
+        setv(r, C_MODND, float(hi))
+        setv(r, C_MODHZ, freq)
+
+    for i, (hi, mode_no, freq) in enumerate(crossing_points):
+        r = i + 1
+        setv(r, C_CRND, float(hi))
+        setv(r, C_CRHZ, freq)
+
+    settxt(1, C_SUMMARY, "SAFE DIAGRAM SUMMARY  (Blade=%d Sector=%d MaxHI=%d)" % (BLADE_COUNT, SECTOR, MAX_HI))
+    settxt(2, C_SUMMARY, "Idle=%d RPM   RL=%d RPM   Margin=%.1f%%" % (int(IDLE_RPM), int(RL_RPM), MARGIN_PCT))
+    row_cursor = 4
+    settxt(row_cursor, C_SUMMARY, "Critical Engine Orders -> ND position, [Idle-margin, RL+margin] Hz:")
+    row_cursor += 1
+    for (eo, nd, t, u) in eo_info:
+        settxt(row_cursor, C_SUMMARY, "  EO=%d -> ND=%d, range %.0f - %.0f Hz" % (eo, int(round(nd)), t, u))
+        row_cursor += 1
+    row_cursor += 1
+    if crossing_details:
+        settxt(row_cursor, C_SUMMARY, "Modes CROSSING a Critical Engine Order:")
+        row_cursor += 1
+        for (hi, mode_no, freq, eos) in crossing_details:
+            eo_str = ",".join([str(e) for e in eos])
+            settxt(row_cursor, C_SUMMARY, "  HI=%d Mode=%d f=%.1f Hz -> CROSSES EO=%s" % (hi, mode_no, freq, eo_str))
+            row_cursor += 1
+    else:
+        settxt(row_cursor, C_SUMMARY, "No mode crosses any Critical Engine Order.")
+        row_cursor += 1
+
+    max_row = max(1, len(ZZ_IDLE), len(mode_points), len(crossing_points), row_cursor)
+
+    rows_xml = []
+    for r in range(1, max_row + 1):
+        if r not in cells_by_row and r not in text_cells_by_row:
+            continue
+        row_cells = {}
+        for c, v in cells_by_row.get(r, {}).items():
+            row_cells[c] = '<c r="%s"><v>%s</v></c>' % (cellref(r, c), v)
+        for c, t in text_cells_by_row.get(r, {}).items():
+            row_cells[c] = '<c r="%s" t="inlineStr"><is><t>%s</t></is></c>' % (cellref(r, c), esc(t))
+        parts = [row_cells[c] for c in sorted(row_cells.keys())]
+        rows_xml.append('<row r="%d">%s</row>' % (r, "".join(parts)))
+
+    last_col = max(C_CRHZ, C_SUMMARY)
+    dim_ref = "A1:%s%d" % (col_letter(last_col), max_row)
+
+    meta = dict(
+        C_ZZ_IDLE_ND=C_ZZ_IDLE_ND, C_ZZ_IDLE_F=C_ZZ_IDLE_F, zz_n=len(ZZ_IDLE),
+        C_ZZ_RL_ND=C_ZZ_RL_ND, C_ZZ_RL_F=C_ZZ_RL_F,
+        C_ZZ_IMG_ND=C_ZZ_IMG_ND, C_ZZ_IMG_F=C_ZZ_IMG_F,
+        C_ZZ_RMG_ND=C_ZZ_RMG_ND, C_ZZ_RMG_F=C_ZZ_RMG_F,
+        eo_cols=eo_cols,
+        C_MODND=C_MODND, C_MODHZ=C_MODHZ, mode_n=len(mode_points),
+        C_CRND=C_CRND, C_CRHZ=C_CRHZ, cr_n=len(crossing_points),
+    )
+
+    hidden_col_xml = ""
+    if C_SUMMARY - 1 >= 16:
+        hidden_col_xml = '<col min="16" max="%d" width="11" customWidth="1" hidden="1"/>' % (C_SUMMARY - 1)
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<dimension ref="%s"/>'
+        '<sheetViews><sheetView showGridLines="0" tabSelected="1" workbookViewId="0"/></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        '<cols><col min="1" max="15" width="11" customWidth="1"/>'
+        '%s'
+        '<col min="%d" max="%d" width="60" customWidth="1"/></cols>'
+        '<sheetData>%s</sheetData>'
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '<drawing r:id="rId1"/>'
+        '</worksheet>'
+    ) % (dim_ref, hidden_col_xml, C_SUMMARY, C_SUMMARY, "".join(rows_xml))
+
+    return sheet_xml, meta
+
+EO_COLOR_PALETTE = ["FF8C00", "9400D3", "FF1493", "00CED1", "FFD700",
+                     "FF00FF", "6A0DAD", "1E90FF", "ADFF2F", "00FA9A"]
+
+def build_chart_xml(meta):
+    sn = "'SAFE Diagram'"
+    series_xml = ""
+    si = 0
+
+    def line_series(idx, name, col_nd, col_f, n, color, width, dash=None, marker=False):
+        cx = col_letter(col_nd)
+        cy = col_letter(col_f)
+        dash_xml = '<a:prstDash val="%s"/>' % dash if dash else ""
+        if marker:
+            marker_xml = ('<c:marker><c:symbol val="circle"/><c:size val="7"/>'
+                          '<c:spPr><a:solidFill><a:srgbClr val="%s"/></a:solidFill>'
+                          '<a:ln><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></c:spPr></c:marker>') % color
+        else:
+            marker_xml = '<c:marker><c:symbol val="none"/></c:marker>'
+        return (
+            '<c:ser><c:idx val="%(idx)d"/><c:order val="%(idx)d"/>'
+            '<c:tx><c:v>%(name)s</c:v></c:tx>'
+            '<c:spPr><a:ln w="%(w)d"><a:solidFill><a:srgbClr val="%(clr)s"/></a:solidFill>%(dash)s</a:ln></c:spPr>'
+            '%(marker)s'
+            '<c:xVal><c:numRef><c:f>%(sn)s!$%(cx)s$1:$%(cx)s$%(n)d</c:f></c:numRef></c:xVal>'
+            '<c:yVal><c:numRef><c:f>%(sn)s!$%(cy)s$1:$%(cy)s$%(n)d</c:f></c:numRef></c:yVal>'
+            '<c:smooth val="0"/></c:ser>'
+        ) % dict(idx=idx, name=esc(name), sn=sn, cx=cx, cy=cy, n=n, clr=color, w=width, dash=dash_xml, marker=marker_xml)
+
+    series_xml += line_series(si, "IDLE RPM", meta["C_ZZ_IDLE_ND"], meta["C_ZZ_IDLE_F"], meta["zz_n"], "548235", 18000); si += 1
+    series_xml += line_series(si, "RL RPM", meta["C_ZZ_RL_ND"], meta["C_ZZ_RL_F"], meta["zz_n"], "C00000", 18000); si += 1
+    series_xml += line_series(si, "IDLE -MARGIN", meta["C_ZZ_IMG_ND"], meta["C_ZZ_IMG_F"], meta["zz_n"], "00B050", 32000, "dash"); si += 1
+    series_xml += line_series(si, "RL +MARGIN", meta["C_ZZ_RMG_ND"], meta["C_ZZ_RMG_F"], meta["zz_n"], "0070C0", 32000, "dash"); si += 1
+
+    for i, (eo, col_nd, col_f) in enumerate(meta["eo_cols"]):
+        clr = EO_COLOR_PALETTE[i % len(EO_COLOR_PALETTE)]
+        series_xml += line_series(si, "EO %d" % eo, col_nd, col_f, 2, clr, 36000, marker=True)
+        si += 1
+
+    cx2 = col_letter(meta["C_MODND"]); cy2 = col_letter(meta["C_MODHZ"])
+    series_xml += (
+        '<c:ser><c:idx val="%(idx)d"/><c:order val="%(idx)d"/>'
+        '<c:tx><c:v>Modes</c:v></c:tx>'
+        '<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>'
+        '<c:marker><c:symbol val="circle"/><c:size val="6"/>'
+        '<c:spPr><a:solidFill><a:srgbClr val="595959"/></a:solidFill></c:spPr></c:marker>'
+        '<c:xVal><c:numRef><c:f>%(sn)s!$%(cx)s$1:$%(cx)s$%(n)d</c:f></c:numRef></c:xVal>'
+        '<c:yVal><c:numRef><c:f>%(sn)s!$%(cy)s$1:$%(cy)s$%(n)d</c:f></c:numRef></c:yVal>'
+        '<c:smooth val="0"/></c:ser>'
+    ) % dict(idx=si, sn=sn, cx=cx2, cy=cy2, n=meta["mode_n"])
+    si += 1
+
+    cx3 = col_letter(meta["C_CRND"]); cy3 = col_letter(meta["C_CRHZ"])
+    series_xml += (
+        '<c:ser><c:idx val="%(idx)d"/><c:order val="%(idx)d"/>'
+        '<c:tx><c:v>Crossing</c:v></c:tx>'
+        '<c:spPr><a:ln><a:noFill/></a:ln></c:spPr>'
+        '<c:marker><c:symbol val="circle"/><c:size val="13"/>'
+        '<c:spPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>'
+        '<a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>'
+        '</c:spPr></c:marker>'
+        '<c:xVal><c:numRef><c:f>%(sn)s!$%(cx)s$1:$%(cx)s$%(n)d</c:f></c:numRef></c:xVal>'
+        '<c:yVal><c:numRef><c:f>%(sn)s!$%(cy)s$1:$%(cy)s$%(n)d</c:f></c:numRef></c:yVal>'
+        '<c:smooth val="0"/></c:ser>'
+    ) % dict(idx=si, sn=sn, cx=cx3, cy=cy3, n=meta["cr_n"])
+
+    plot_layout = (
+        '<c:layout>'
+        '<c:manualLayout>'
+        '<c:layoutTarget val="inner"/>'
+        '<c:xMode val="edge"/><c:yMode val="edge"/>'
+        '<c:x val="0.10"/><c:y val="0.12"/>'
+        '<c:w val="0.70"/><c:h val="0.76"/>'
+        '</c:manualLayout>'
+        '</c:layout>'
+    )
+
+    chart_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<c:chart>'
+        '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1300" b="1"/></a:pPr><a:r><a:rPr sz="1300" b="1"/><a:t>SAFE DIAGRAM  -  Blade=%(blade)d Sector=%(sector)d MaxHI=%(maxhi)d  -  Idle=%(idle)d RPM / RL=%(rl)d RPM</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title>'
+        '<c:autoTitleDeleted val="0"/>'
+        '<c:plotArea>%(layout)s'
+        '<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>'
+        '%(series)s'
+        '<c:axId val="10"/><c:axId val="20"/>'
+        '</c:scatterChart>'
+        '<c:valAx><c:axId val="10"/><c:scaling><c:orientation val="minMax"/><c:max val="%(max_nd).1f"/><c:min val="0"/></c:scaling>'
+        '<c:delete val="0"/><c:axPos val="b"/>'
+        '<c:majorGridlines/>'
+        '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Nodal Diameter (Harmonic Index)</a:t></a:r></a:p></c:rich></c:tx>'
+        '<c:overlay val="0"/></c:title>'
+        '<c:numFmt formatCode="0" sourceLinked="0"/>'
+        '<c:majorTickMark val="out"/><c:minorTickMark val="none"/>'
+        '<c:tickLblPos val="low"/>'
+        '<c:crossAx val="20"/><c:crosses val="autoZero"/>'
+        '<c:majorUnit val="1"/>'
+        '</c:valAx>'
+        '<c:valAx><c:axId val="20"/><c:scaling><c:orientation val="minMax"/><c:max val="%(max_f).2f"/><c:min val="0"/></c:scaling>'
+        '<c:delete val="0"/><c:axPos val="l"/>'
+        '<c:majorGridlines/>'
+        '<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>Frequency (Hz)</a:t></a:r></a:p></c:rich></c:tx>'
+        '<c:overlay val="0"/></c:title>'
+        '<c:numFmt formatCode="#,##0" sourceLinked="0"/>'
+        '<c:majorTickMark val="out"/><c:minorTickMark val="none"/>'
+        '<c:tickLblPos val="nextTo"/>'
+        '<c:crossAx val="10"/><c:crosses val="autoZero"/>'
+        '</c:valAx>'
+        '</c:plotArea>'
+        '<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>'
+        '<c:plotVisOnly val="0"/>'
+        '<c:dispBlanksAs val="gap"/>'
+        '</c:chart>'
+        '</c:chartSpace>'
+    ) % dict(blade=BLADE_COUNT, sector=SECTOR, maxhi=MAX_HI, idle=int(IDLE_RPM), rl=int(RL_RPM),
+              series=series_xml, layout=plot_layout,
+              max_nd=AXIS_MAX_ND, max_f=AXIS_MAX_FREQ)
+
+    return chart_xml
+
+def write_entry(archive, name, text):
+    entry = archive.CreateEntry(name, CompressionLevel.Optimal)
+    stream = entry.Open()
+    enc = UTF8Encoding(False)
+    data = enc.GetBytes(text)
+    stream.Write(data, 0, data.Length)
+    stream.Flush()
+    stream.Dispose()
+
+def build_xlsx(output_path):
+    sheet1_xml = build_inputs_sheet_xml()
+    sheet2_xml, meta = build_diagram_sheet_xml()
+    chart_xml = build_chart_xml(meta)
+
+    fs = FileStream(output_path, FileMode.Create)
+    archive = ZipArchive(fs, ZipArchiveMode.Create)
+    try:
+        write_entry(archive, "[Content_Types].xml", CONTENT_TYPES)
+        write_entry(archive, "_rels/.rels", ROOT_RELS)
+        write_entry(archive, "xl/workbook.xml", WORKBOOK_XML)
+        write_entry(archive, "xl/_rels/workbook.xml.rels", WORKBOOK_RELS)
+        write_entry(archive, "xl/styles.xml", STYLES_XML)
+        write_entry(archive, "xl/theme/theme1.xml", THEME_XML)
+        write_entry(archive, "xl/worksheets/sheet1.xml", sheet1_xml)
+        write_entry(archive, "xl/worksheets/sheet2.xml", sheet2_xml)
+        write_entry(archive, "xl/worksheets/_rels/sheet2.xml.rels", SHEET2_RELS)
+        write_entry(archive, "xl/drawings/drawing1.xml", DRAWING_XML)
+        write_entry(archive, "xl/drawings/_rels/drawing1.xml.rels", DRAWING_RELS)
+        write_entry(archive, "xl/charts/chart1.xml", chart_xml)
+    finally:
+        archive.Dispose()
+        fs.Dispose()
+
+if _MAIN_OK:
+    try:
+        build_xlsx(OUT_PATH)
+        msg = ("Excel file created:\n\n%s\n\n"
+               "Blade=%d  Sector=%d  MaxHI=%d\n"
+               "Idle=%d RPM  RL=%d RPM  Margin=%.1f%%\n"
+               "Critical Engine Orders: %s\n"
+               "Modes crossing a Critical EO: %d") % (
+            OUT_PATH, BLADE_COUNT, SECTOR, MAX_HI, int(IDLE_RPM), int(RL_RPM), MARGIN_PCT,
+            ",".join([str(e) for e in CRITICAL_EOS]), len(crossing_points))
+        print(msg)
+        MessageBox.Show(msg, "SAFE Diagram")
+    except Exception as ex:
+        err_msg = "An error occurred:\n\n%s" % str(ex)
+        print(err_msg)
+        MessageBox.Show(err_msg, "Error")
