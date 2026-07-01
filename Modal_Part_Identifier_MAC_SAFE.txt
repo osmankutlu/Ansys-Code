@@ -6,6 +6,7 @@ import os, re
 import clr
 clr.AddReference("System.Windows.Forms")
 clr.AddReference("System.Drawing")
+clr.AddReference("System.Core")   # System.Threading.Tasks.Parallel icin
 
 from System.Windows.Forms import (Form, Label, ComboBox, Button,
                                   OpenFileDialog, TextBox, DialogResult,
@@ -1380,6 +1381,8 @@ class ModalIdDialog(Form):
 # MAC MODULU  (ana koddan analysis/twin_hz/parsed_clean alir, RST zorunlu)
 # =============================================================================
 import zipfile as _zipfile
+import System
+from System.Threading.Tasks import Parallel
 
 try:
     _MAC_NOT = NormalOrientationType
@@ -1612,7 +1615,10 @@ def _mac_dpf_extract_phi_bulk(dpf, ds, set_ids):
 
 def _mac_build_phi_matrix_bulk(dpf, ds, model, mode_list, prog=None, labels=None):
     """TOPLU OKUMA: RST tek operator cagrisiyla acilir, tum setler RAM'deki
-    bir sozlukte (data_by_set) tutulur, phi vektorleri oradan kurulur."""
+    bir sozlukte (data_by_set) tutulur, phi vektorleri PARALEL (Parallel.For)
+    olarak kuruluyor -- her thread kendi idx'ine yazdigi icin cakisma yok.
+    NOT: WinForms progress dialog thread-safe degildir; bu yuzden paralel
+    dongu icinde prog.update() CAGRILMAZ, sadece oncesinde/sonrasinda."""
     n = len(mode_list)
     set_ids = [m[0] for m in mode_list]
 
@@ -1623,33 +1629,70 @@ def _mac_build_phi_matrix_bulk(dpf, ds, model, mode_list, prog=None, labels=None
 
     data_by_set, node_ids = _mac_dpf_extract_phi_bulk(dpf, ds, set_ids)
 
-    phis = []; freqs = []
-    for idx, (sid, hi, fe) in enumerate(mode_list):
-        lbl = labels[idx] if (labels and idx < len(labels)) else "Set {0}".format(sid)
-        if prog and (idx % 5 == 0 or idx == n - 1):
-            prog.update("MAC (bulk): building phi vectors ({0}/{1})".format(idx+1, n),
-                        "{0}  -  {1:.1f} Hz".format(lbl, fe))
+    n_nodes = len(node_ids)
+    freqs   = [m[2] for m in mode_list]
+    phis    = [None] * n   # her worker sadece kendi idx'ine yazar
+
+    n_cores = System.Environment.ProcessorCount
+    if prog:
+        prog.update("MAC (bulk): building phi vectors (parallel, {0} cores)...".format(n_cores),
+                    "{0} modes".format(n))
+    print("  MAC (bulk): phi vektorleri {0} cekirdekte paralel kuruluyor...".format(n_cores))
+
+    _missing = []   # thread-safe append yerine index bazli isaretleme kullanilir
+    _missing_flags = [False] * n
+
+    def _build_one(idx):
+        sid = mode_list[idx][0]
         node_vals = data_by_set.get(sid)
-        if node_vals is None:
-            print("    MAC (bulk) UYARI: Set {0} icin veri bulunamadi.".format(sid))
-            phis.append([0.0] * (len(node_ids) * 3))
-            freqs.append(fe)
-            continue
-        phi = []
-        for nid in node_ids:
-            u = node_vals.get(nid, (0.0, 0.0, 0.0))
-            phi.append(u[0]); phi.append(u[1]); phi.append(u[2])
-        phis.append(phi); freqs.append(fe)
+        phi = [0.0] * (n_nodes * 3)
+        if node_vals is not None:
+            for k in range(n_nodes):
+                u = node_vals.get(node_ids[k], (0.0, 0.0, 0.0))
+                phi[k*3]     = u[0]
+                phi[k*3 + 1] = u[1]
+                phi[k*3 + 2] = u[2]
+        else:
+            _missing_flags[idx] = True
+        phis[idx] = phi
+
+    Parallel.For(0, n, _build_one)
+
+    for idx in range(n):
+        if _missing_flags[idx]:
+            print("    MAC (bulk) UYARI: Set {0} icin veri bulunamadi.".format(mode_list[idx][0]))
+
+    if prog:
+        prog.update("MAC (bulk): phi vectors ready.", "{0} modes".format(n))
 
     return phis, freqs, node_ids
 
 def _mac_compute(phis):
+    """MAC matrisi PARALEL hesaplanir (System.Threading.Tasks.Parallel.For).
+    IronPython'da GIL olmadigi icin bu gercek coklu-cekirdek paralellik saglar.
+    Optimizasyon: her modun kendi-ile-nokta-carpimi (self dot) once bir kez
+    hesaplanip cache'lenir, boylece O(n^2) yerine sadece capraz terimler
+    (num) her cift icin hesaplanir."""
     n = len(phis)
     mac = [[0.0]*n for _ in range(n)]
-    for i in range(n):
-        for j in range(i, n):
-            v = _mac_value(phis[i], phis[j])
-            mac[i][j] = v; mac[j][i] = v
+
+    self_dots = [0.0] * n
+    def _self(i):
+        self_dots[i] = _mac_dot(phis[i], phis[i])
+    Parallel.For(0, n, _self)
+
+    def _row(i):
+        pi  = phis[i]
+        dii = self_dots[i]
+        mac[i][i] = 1.0 if dii > 1e-30 else 0.0
+        for j in range(i + 1, n):
+            num = _mac_dot(pi, phis[j])
+            den = dii * self_dots[j]
+            v = 0.0 if den < 1e-30 else (num * num) / den
+            mac[i][j] = v
+            mac[j][i] = v
+
+    Parallel.For(0, n, _row)
     return mac
 
 def _mac_make_labels(mode_list):
