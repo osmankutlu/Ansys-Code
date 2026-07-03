@@ -1,0 +1,1153 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# TEK BASINA CALISAN TEST SCRIPTI (POPUP + PROGRESS PENCERESI + TXT RAPOR)
+# Amac: RST'den DPF ile strain energy okumanin gercekten calisip
+# calismadigini, ana Modal Part Identifier aracina entegre etmeden once
+# hizlica dogrulamak.
+#
+# KULLANIM:
+#   1) Bu scripti Mechanical'in Scripting/Automation konsoluna yapistir
+#      (veya .py olarak kaydedip 'Run Script File' ile calistir).
+#   2) Acilan popup'ta RST dosyasini, test edilecek Named Selection'lari
+#      ve cikti klasorunu sec, Run'a bas.
+#   3) Calisma sirasinda bir Progress penceresi acilir, her adim ve her
+#      diagnostik satir CANLI olarak bu pencereye ve konsola dusar.
+#      Istenirse Stop ile calisma iptal edilebilir.
+#   4) Hem konsola hem de secilen klasore yazilan TXT rapora
+#      (RST_SE_Test_Report.txt) TUM diagnostik satirlar dusecek.
+#
+# Test ettigi 3 sey:
+#   A) MeshDataByName("Global").GetElementIdsFromRegionIds(...) gercekten
+#      body (Named Selection) -> mesh element ID cevirisi yapiyor mu?
+#   B) RST'de strain energy hangi DPF operator adiyla mevcut (ENG_SE mi,
+#      baska bir isim mi)?
+#   C) Okunan degerler mantikli mi -- ALL BODIES toplami ile secilen
+#      body'lerin toplami ayni buyuklukte mi?
+# =============================================================================
+import os
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (
+    Form, Label, ComboBox, Button, OpenFileDialog, TextBox, DialogResult,
+    FormStartPosition, ComboBoxStyle, MessageBox, FormBorderStyle, GroupBox,
+    FlatStyle, Application, ProgressBar, ProgressBarStyle, ScrollBars
+)
+from System.Drawing import Size, Point, Font, FontStyle, Color
+import Microsoft.Win32 as Win32
+
+# =============================================================================
+# STIL / REGISTRY
+# =============================================================================
+FONT_TITLE = None
+PAD = 14
+
+CLR_BTN_RUN  = Color.FromArgb(0, 120, 212)
+CLR_BTN_RUN_FG = Color.White
+CLR_BTN_REM  = Color.FromArgb(196, 43, 28)
+CLR_BTN_REM_FG = Color.White
+CLR_BTN_NORM = Color.FromArgb(225, 225, 225)
+
+def _style_btn(btn, kind="normal"):
+    try:
+        btn.FlatStyle = FlatStyle.Flat
+        btn.FlatAppearance.BorderSize = 0
+        if kind == "run":
+            btn.BackColor = CLR_BTN_RUN; btn.ForeColor = CLR_BTN_RUN_FG
+        elif kind == "remove":
+            btn.BackColor = CLR_BTN_REM; btn.ForeColor = CLR_BTN_REM_FG
+        else:
+            btn.BackColor = CLR_BTN_NORM; btn.ForeColor = Color.Black
+    except: pass
+
+def _no_scroll_cmb(cmb):
+    def _block(s, e):
+        try: e.Handled = True
+        except: pass
+    cmb.MouseWheel += _block
+    return cmb
+
+REG_KEY = r"Software\RSTSETest"
+
+def _reg_get(name):
+    try:
+        key = Win32.Registry.CurrentUser.OpenSubKey(REG_KEY)
+        if key is None: return ""
+        val = key.GetValue(name); key.Close()
+        return str(val) if val else ""
+    except: return ""
+
+def _reg_set(name, val):
+    try:
+        key = Win32.Registry.CurrentUser.CreateSubKey(REG_KEY)
+        key.SetValue(name, val); key.Close()
+    except: pass
+
+# =============================================================================
+# PROGRESS POPUP (ana kodla ayni mantik: Stop butonu, marquee bar, canli log)
+# =============================================================================
+_CANCEL = [False]
+_PROG = [None]   # aktif ProgressDialog varsa buraya konur, _log() bunu kullanir
+
+class ProgressDialog(Form):
+    def __init__(self):
+        self.Text            = "RST Strain Energy Test - Processing"
+        self.Font            = FONT_TITLE
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedSingle
+        self.MaximizeBox     = True
+        self.MinimizeBox     = True
+        self.ControlBox      = True
+        self.TopMost         = True
+        self.ClientSize      = Size(640, 440)
+
+        self.lbl_step = Label()
+        self.lbl_step.Text     = "Initializing..."
+        self.lbl_step.Location = Point(14, 14)
+        self.lbl_step.Size     = Size(612, 24)
+        self.lbl_step.Font     = FONT_TITLE
+        self.Controls.Add(self.lbl_step)
+
+        self.txt_log = TextBox()
+        self.txt_log.Location   = Point(14, 44)
+        self.txt_log.Size       = Size(612, 320)
+        self.txt_log.Multiline  = True
+        self.txt_log.ReadOnly   = True
+        self.txt_log.ScrollBars = ScrollBars.Vertical
+        try:
+            self.txt_log.Font = Font("Consolas", 8.5)
+        except:
+            pass
+        self.Controls.Add(self.txt_log)
+
+        self.bar = ProgressBar()
+        self.bar.Location = Point(14, 376)
+        self.bar.Size     = Size(490, 22)
+        self.bar.Style    = ProgressBarStyle.Marquee
+        self.bar.MarqueeAnimationSpeed = 30
+        self.Controls.Add(self.bar)
+
+        self.btn_cancel = Button()
+        self.btn_cancel.Text     = "Stop"
+        self.btn_cancel.Location = Point(514, 373)
+        self.btn_cancel.Size     = Size(112, 28)
+        self.btn_cancel.Click   += self._on_cancel
+        _style_btn(self.btn_cancel, "remove")
+        self.Controls.Add(self.btn_cancel)
+
+        self.FormClosing += self._on_closing
+        self._closed_programmatically = False
+
+    def _on_cancel(self, s, a):
+        _CANCEL[0] = True
+        self.lbl_step.Text = "Cancelling..."
+        Application.DoEvents()
+
+    def _on_closing(self, s, a):
+        if not self._closed_programmatically and not _CANCEL[0]:
+            _CANCEL[0] = True
+
+    def set_step(self, step):
+        self.lbl_step.Text = step
+        Application.DoEvents()
+
+    def append_log(self, line):
+        try:
+            self.txt_log.AppendText(line + "\r\n")
+        except:
+            pass
+        Application.DoEvents()
+
+    def close_ok(self):
+        self._closed_programmatically = True
+        self.Close()
+
+    def done(self):
+        self.bar.Style = ProgressBarStyle.Continuous
+        self.bar.Value = 100
+        Application.DoEvents()
+
+# =============================================================================
+# RAPOR TOPLAYICI -- hem konsola hem progress penceresine hem de sonda
+# TXT'ye yazilacak satirlar
+# =============================================================================
+_REPORT_LINES = []
+
+def _log(line=""):
+    print(line)
+    _REPORT_LINES.append(line)
+    if _PROG[0] is not None:
+        _PROG[0].append_log(line)
+
+def _step(step_text):
+    """Progress penceresindeki ust basligi degistirir (rapora da dusurur)."""
+    _log("")
+    _log("=" * 70)
+    _log(step_text)
+    _log("=" * 70)
+    if _PROG[0] is not None:
+        _PROG[0].set_step(step_text)
+
+def _diag(msg, detail=""):
+    _log("TEST: " + msg + ((" -- " + detail) if detail else ""))
+
+def _qty_to_float(q):
+    for attr in ("Value", "Magnitude"):
+        try: return float(getattr(q, attr))
+        except: pass
+    try: return float(str(q).split()[0].replace(",", "."))
+    except: return 0.0
+
+def find_ns(model, ns_name):
+    try:
+        for item in model.NamedSelections.Children:
+            try:
+                sub = list(item.Children)
+                if len(sub) > 0:
+                    for ns in sub:
+                        try:
+                            if ns.Name == ns_name: return ns
+                        except: pass
+                else:
+                    if item.Name == ns_name: return item
+            except:
+                if item.Name == ns_name: return item
+    except: pass
+    return None
+
+def get_ns_names(model):
+    names = []
+    try:
+        for item in model.NamedSelections.Children:
+            try:
+                sub = list(item.Children)
+                if len(sub) > 0:
+                    for ns in sub:
+                        try: names.append(ns.Name)
+                        except: pass
+                else:
+                    names.append(item.Name)
+            except:
+                names.append(item.Name)
+    except: pass
+    return names
+
+# =============================================================================
+# ADIM A: Body -> element ID cozumu
+# =============================================================================
+def _flatten_region_elements(raw):
+    """GetElementIdsFromRegionIds(geo_ids) TEK bir flat element ID listesi
+    DEGIL, her geometri ID'si icin ayri bir KeyValuePair<int, IList<int>>
+    (region_id -> element_id_listesi) dondurur (test ciktisiyla teyit
+    edildi). Bu fonksiyon hepsini TEK bir flat, tekrarsiz (set) element
+    ID listesine acar.
+
+    ONEMLI (hata duzeltmesi): 'raw' bazen None donebilir (ornegin gecersiz
+    veya bos bir geo_id verildiginde) -- bu durumda 'for item in raw'
+    dogrudan 'NoneType is not iterable' hatasi verir. Bu yuzden EN BASTA
+    None kontrolu yapiyoruz."""
+    elem_ids = set()
+    if raw is None:
+        _diag("UYARI: GetElementIdsFromRegionIds None dondurdu (element ID cozulemedi).")
+        return elem_ids
+    try:
+        raw_list = list(raw)
+    except Exception as ex:
+        _diag("UYARI: donen deger iterable degil (list() basarisiz)", str(ex))
+        return elem_ids
+
+    for item in raw_list:
+        # Beklenen: KeyValuePair -- .Key (geo_id) / .Value (element listesi)
+        try:
+            values = item.Value
+            if values is not None:
+                for v in values:
+                    elem_ids.add(int(v))
+            continue
+        except AttributeError:
+            pass
+        # Alternatif: (geo_id, [elem_ids]) tuple/list seklinde gelirse
+        try:
+            values = item[1]
+            if values is not None:
+                for v in values:
+                    elem_ids.add(int(v))
+            continue
+        except (TypeError, IndexError):
+            pass
+        # Son care: zaten duz bir int ise (baska bir Ansys versiyonunda
+        # API flat liste donduruyor olabilir)
+        try:
+            elem_ids.add(int(item))
+        except (TypeError, ValueError):
+            pass
+    return elem_ids
+
+def step_A_resolve_elements(model, body_names):
+    """A) Body -> element ID cozumu (Mechanical'in kendi mesh API'si ile,
+    DPF'e hic girmeden)."""
+    _step("ADIM A: Body -> element ID cozumu (GetElementIdsFromRegionIds)")
+
+    mesh_data = ExtAPI.DataModel.MeshDataByName("Global")
+    if mesh_data is None:
+        _diag("BASARISIZ: MeshDataByName('Global') None dondurdu.")
+        return None
+    _diag("MeshDataByName('Global') BASARILI.")
+
+    body_elem_ids = {}
+    for name in body_names:
+        if _CANCEL[0]: return body_elem_ids
+        ns = find_ns(model, name)
+        if ns is None:
+            _diag("UYARI: Named Selection bulunamadi: '{0}'".format(name))
+            continue
+        try:
+            geo_ids_raw = ns.Location.Ids
+            geo_ids = list(geo_ids_raw) if geo_ids_raw is not None else []
+        except Exception as ex:
+            _diag("UYARI: '{0}' icin ns.Location.Ids okunamadi".format(name), str(ex))
+            continue
+        if not geo_ids:
+            _diag("UYARI: '{0}' icin geometri ID listesi BOS.".format(name))
+            body_elem_ids[name] = set()
+            continue
+        _diag("'{0}': geometri ID'leri".format(name), str(geo_ids))
+        try:
+            raw = mesh_data.GetElementIdsFromRegionIds(geo_ids)
+        except Exception as ex:
+            _diag("BASARISIZ: '{0}' icin GetElementIdsFromRegionIds hata verdi".format(name), str(ex))
+            continue
+
+        elem_ids = _flatten_region_elements(raw)
+        body_elem_ids[name] = elem_ids
+        if elem_ids:
+            sample = list(elem_ids)[:5]
+            _diag("BASARILI: '{0}' -> {1} geometri bolgesi -> TOPLAM {2} element ID  (ilk 5: {3})".format(
+                name, len(geo_ids), len(elem_ids), sample))
+        else:
+            _diag("UYARI: '{0}' -> flatten sonrasi 0 element ID (BOS, bir sorun var).".format(name))
+
+    return body_elem_ids
+
+# =============================================================================
+# ADIM B: RST acma + mevcut sonuc adlarini kesfetme
+# =============================================================================
+def _get_result_info(dpf_model):
+    """result_info'yu birden fazla olasi isim/casing ile dener (bu ortam
+    dusuk seviye .NET DPF API'si kullaniyor -- pydpf-core'daki
+    'model.metadata.result_info' burada CALISMAYABILIR, PascalCase
+    varyasyonlari denemek gerekiyor)."""
+    attempts = [
+        ("model.metadata.result_info", lambda: dpf_model.metadata.result_info),
+        ("model.result_info",          lambda: dpf_model.result_info),
+        ("model.ResultInfo",           lambda: dpf_model.ResultInfo),
+        ("model.Metadata.ResultInfo",  lambda: dpf_model.Metadata.ResultInfo),
+    ]
+    for name, fn in attempts:
+        try:
+            ri = fn()
+            if ri is None:
+                _diag("'{0}' None dondurdu, sonraki deneniyor.".format(name))
+                continue
+            _diag("result_info BULUNDU ('{0}' ile).".format(name))
+            return ri
+        except Exception as ex:
+            _diag("'{0}' basarisiz".format(name), str(ex))
+    return None
+
+def _result_info_names(dpf_model):
+    """result_info'dan sonuc adlari listesini GUVENLI sekilde cikarir
+    (available_results None donerse BOS liste ile devam eder, crash etmez)."""
+    ri_cands = []
+    ri = _get_result_info(dpf_model)
+    if ri is None:
+        _diag("UYARI: result_info HICBIR yontemle bulunamadi.")
+        return ri_cands
+    avail = None
+    try:
+        avail = ri.available_results
+    except Exception as ex:
+        _diag("UYARI: available_results okunamadi (kucuk harf)", str(ex))
+    if avail is None:
+        try:
+            avail = ri.AvailableResults
+        except Exception as ex:
+            _diag("UYARI: AvailableResults okunamadi (buyuk harf)", str(ex))
+    if avail is None:
+        _diag("UYARI: available_results/AvailableResults None -- sonuc adi listesi cikarilamadi.")
+        return ri_cands
+    try:
+        avail_list = list(avail)
+    except Exception as ex:
+        _diag("UYARI: available_results iterable degil", str(ex))
+        return ri_cands
+    for r in avail_list:
+        try:
+            rname = (getattr(r, "operator_name", None) or getattr(r, "OperatorName", None)
+                    or getattr(r, "name", None) or getattr(r, "Name", None))
+            if rname: ri_cands.append(str(rname))
+        except: pass
+    return ri_cands
+
+def step_B_discover_modes(rst_path):
+    """DPF ile RST'yi ac, mevcut sonuc adlarini ve HI/mode/freq bilgisini oku."""
+    _step("ADIM B: RST acma + mevcut sonuc adlarini kesfetme")
+
+    import mech_dpf
+    import Ans.DataProcessing as dpf
+    try: mech_dpf.setExtAPI(ExtAPI)
+    except: pass
+
+    if not os.path.exists(rst_path):
+        _diag("BASARISIZ: RST dosyasi bulunamadi: " + rst_path)
+        return None, None, None, None
+
+    ds = dpf.DataSources(rst_path)
+    dpf_model = dpf.Model(ds)
+    _diag("RST yuklendi (DPF Model olusturuldu).")
+
+    ri_cands = _result_info_names(dpf_model)
+    if ri_cands:
+        _diag("RST'deki TUM sonuc adlari:", str(ri_cands))
+
+    energy_like = [c for c in ri_cands if ("energ" in c.lower() or "strain" in c.lower())]
+    if energy_like:
+        _diag("Enerji/strain iceren aday adlar (bunlar denenecek):", str(energy_like))
+    else:
+        _diag("UYARI: result_info icinde enerji/strain iceren isim bulunamadi -- "
+             "yine de bilinen isimler (ENG_SE vb.) denenecek.")
+
+    tfs = dpf_model.TimeFreqSupport
+    try: nsets = int(tfs.NumberSets)
+    except: nsets = 0
+
+    freqs = []
+    try:
+        ff = tfs.TimeFreqs
+        ff_data = ff.Data if ff is not None else None
+        if ff_data is not None:
+            freqs = [_qty_to_float(x) for x in list(ff_data)]
+    except Exception as ex:
+        _diag("UYARI: TimeFreqs okunamadi", str(ex))
+        freqs = []
+
+    his = []
+    try:
+        hf = tfs.GetHarmonicIndices()
+        hf_data = hf.Data if hf is not None else None
+        if hf_data is not None:
+            his = [int(round(_qty_to_float(x))) for x in list(hf_data)]
+    except Exception as ex:
+        _diag("GetHarmonicIndices basarisiz, HarmonicIndices deneniyor", str(ex))
+        try:
+            hf = tfs.HarmonicIndices
+            hf_data = hf.Data if hf is not None else None
+            if hf_data is not None:
+                his = [int(round(_qty_to_float(x))) for x in list(hf_data)]
+        except Exception as ex2:
+            _diag("UYARI: HarmonicIndices de okunamadi", str(ex2))
+            his = []
+
+    _diag("Toplam set sayisi (NumberSets): {0}".format(nsets))
+    mode_list = []
+    counters = {}
+    for i in range(nsets):
+        sid = i + 1
+        hi = abs(his[i]) if i < len(his) else 0
+        fr = freqs[i] if i < len(freqs) else 0.0
+        counters[hi] = counters.get(hi, 0) + 1
+        mode_list.append((sid, hi, counters[hi], fr))
+
+    _log("  Set  HI  Mode(local)  Freq(Hz)")
+    for (sid, hi, mode_local, fr) in mode_list[:15]:
+        _log("  {0:>4} {1:>4} {2:>10}  {3:>10.2f}".format(sid, hi, mode_local, fr))
+    if len(mode_list) > 15:
+        _log("  ... ({0} set daha var)".format(len(mode_list) - 15))
+
+    return dpf, ds, dpf_model, mode_list
+
+# =============================================================================
+# ADIM C: Strain energy okuma
+# =============================================================================
+def _discover_energy_operator_names(dpf):
+    """dpf.operators.result modulunde GERCEKTEN var olan (Python binding'i
+    mevcut) enerji/strain-benzeri isimleri dir() ile tarar. result_info
+    yolu bu ortamda calismadigi icin (available_results/AvailableResults
+    yok) EN GUVENILIR yontem bu -- cunku dir() sadece FIILEN cagirilabilir
+    isimleri dondurur."""
+    names = []
+    try:
+        all_names = [a for a in dir(dpf.operators.result) if not a.startswith("_")]
+        names = [a for a in all_names if ("energ" in a.lower() or "eng" in a.lower()
+                                          or "strain" in a.lower())]
+        _diag("dpf.operators.result icindeki TUM enerji/strain-benzeri isimler (dir() ile):",
+             str(names))
+    except Exception as ex:
+        _diag("UYARI: dir(dpf.operators.result) basarisiz", str(ex))
+    return names
+
+# Bu isimler ACIKCA explicit-dynamics (LS-DYNA), thermal, plastic/creep veya
+# CFD'ye ozgudur -- lineer implicit modal (cyclic symmetry, prestress) analiz
+# icin ANLAMSIZDIR ve her zaman 0 doner. Aday sirasinda EN SONA atilirlar ki
+# script bunlari "basarili" sanip erken durmasin.
+_IRRELEVANT_ENERGY_KEYWORDS = [
+    "hourglass", "creep", "plastic", "thermal", "kinetic", "swelling",
+    "turbulent", "global_", "part_", "beam_", "joint", "sliding",
+    "rigid_body_stopper", "spring_damper", "system_damping", "eroded",
+    "cyclic_expanded", "incremental_energy",
+]
+# Bu isimler dogrudan lineer elastik strain energy ile ilgili -- EN ONCE
+# denenecekler (ENERGYPOTENTIAL / MAPDL SENE'nin en olasi karsiliklari).
+_PRIORITY_ENERGY_KEYWORDS = [
+    "eng_se", "cyclic_strain_energy", "stiffness_matrix_energy",
+    "elastic_strain_energy_density", "workflow_energy_per_harmonic",
+    "co_energy", "elastic_strain_energy",
+]
+
+def _rank_energy_candidates(dir_cands):
+    priority = []
+    normal = []
+    irrelevant = []
+    for c in dir_cands:
+        cl = c.lower()
+        if any(k in cl for k in _PRIORITY_ENERGY_KEYWORDS):
+            priority.append(c)
+        elif any(k in cl for k in _IRRELEVANT_ENERGY_KEYWORDS):
+            irrelevant.append(c)
+        else:
+            normal.append(c)
+    return priority + normal + irrelevant
+
+def _field_container_nonzero_info(fc, nf):
+    """fc icindeki TUM field'larin Data'sini tarar; toplam element sayisini
+    VE sifirdan farkli (abs > 1e-30) deger sayisini dondurur. Bir aday
+    'basarili' sayilmadan once bu ikinci sayi > 0 OLMALI -- yoksa yapisal
+    olarak dogru ama fizik olarak BOS (ornegin explicit-dynamics'e ozgu bir
+    alanin implicit modal analizde her zaman 0 donmesi gibi) bir sonuc
+    yanlislikla kabul edilir."""
+    total_elem = 0
+    nonzero_elem = 0
+    for fi in range(nf):
+        try: f = fc[fi]
+        except: f = fc.GetFieldByIndex(fi)
+        try:
+            d = f.Data
+            vals = list(d) if d is not None else []
+        except:
+            vals = []
+        total_elem += len(vals)
+        for v in vals:
+            try:
+                if abs(float(v)) > 1e-30:
+                    nonzero_elem += 1
+            except:
+                pass
+    return total_elem, nonzero_elem
+
+def step_C_read_energy(dpf, ds, dpf_model, set_ids):
+    """Verilen set_id'ler icin element strain energy'sini TEK cagriyla oku.
+    Iki farkli API tarzini dener:
+      - YUKSEK SEVIYE: dpf.operators.result.<isim>() -- varsa .inputs.x.Connect()
+      - DUSUK SEVIYE:  dpf.Operator(<isim>) -- .Connect(pin, deger) + birden
+        fazla cikti alma yontemi (GetOutput(pin) VEYA outputs.fields_container)
+
+    ONEMLI: Bir aday field(lar) dondurse VE icinde 'element sayisi kadar'
+    veri olsa bile, o veri TAMAMEN SIFIRSA (ornegin artificial_hourglass_energy
+    gibi explicit-dynamics'e ozgu, implicit modal analizde hep 0 donen bir
+    alan) bu aday YINE DE BASARISIZ sayilir ve bir sonraki adaya gecilir."""
+    _step("ADIM C: Strain energy okuma (set_ids={0})".format(set_ids))
+
+    ri_cands = _result_info_names(dpf_model)
+    dir_cands_raw = _discover_energy_operator_names(dpf)
+    dir_cands = _rank_energy_candidates(dir_cands_raw)
+    ri_energy_cands = [c for c in ri_cands if ("energ" in c.lower() or "strain" in c.lower()
+                                                or c.upper() == "ENG_SE")]
+    # Oncelik sirasi: 1) result_info'daki enerji adaylari, 2) dir() ile
+    # KESIN VAR OLDUGU dogrulanan Python binding'leri (alakali->alakasiz
+    # siralanmis), 3) bilinen isimler (baska Ansys surumlerinde farkli
+    # casing/isim olabilir, guvenlik agi olarak).
+    candidates = (ri_energy_cands + dir_cands +
+                 ["ENG_SE", "elastic_strain_energy_density",
+                  "stiffness_matrix_energy", "cyclic_strain_energy"])
+    seen = set(); candidates_unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c); candidates_unique.append(c)
+
+    _diag("Denenecek adaylar (alakaliya gore siralanmis):", str(candidates_unique))
+
+    op = None; used_name = None; fc = None; nf = 0
+    for cand in candidates_unique:
+        if _CANCEL[0]: return None, None
+        _diag("Deneniyor: '{0}'".format(cand))
+
+        op = None; op_is_highlevel = False
+        try:
+            factory = getattr(dpf.operators.result, cand, None)
+            if factory is not None:
+                op = factory()
+                op_is_highlevel = True
+                _diag("  -> YUKSEK SEVIYE operator olusturuldu (dpf.operators.result.{0}())".format(cand))
+            else:
+                _diag("  -> UYARI: getattr(dpf.operators.result, '{0}', None) None dondurdu "
+                     "(dir()'de gorunse bile bazen gercek attribute erisimi basarisiz olabiliyor -- "
+                     "dusuk seviyeye geciliyor).".format(cand))
+        except Exception as ex:
+            _diag("  -> yuksek seviye olusturma basarisiz", str(ex))
+
+        if op is None:
+            try:
+                op = dpf.Operator(cand)
+                op_is_highlevel = False
+                _diag("  -> DUSUK SEVIYE Operator('{0}') olusturuldu.".format(cand))
+            except Exception as ex:
+                _diag("  -> Operator('{0}') OLUSTURULAMADI".format(cand), str(ex))
+                continue
+
+        try:
+            if op_is_highlevel:
+                op.inputs.data_sources.Connect(ds)
+                op.inputs.time_scoping.Connect(list(set_ids))
+                try:
+                    op.inputs.read_cyclic.Connect(1)
+                    _diag("  -> read_cyclic=1 baglandi (BASE SEKTOR).")
+                except:
+                    _diag("  -> UYARI: read_cyclic input yok, base sektor garantisi YOK.")
+                fc = op.outputs.fields_container.GetData()
+            else:
+                # Dusuk seviye API: pin 0 = time_scoping, pin 4 = data_sources.
+                op.Connect(0, list(set_ids))
+                op.Connect(4, ds)
+                # Cikti almak icin BIRDEN FAZLA yontem dene -- 'GetOutput'
+                # bu ortamda bazi Operator'larda YOK ('Operator' object has
+                # no attribute 'GetOutput' hatasi daha once gorulmustu),
+                # ama '.outputs' proxy'si dusuk seviye Operator'larda da
+                # calisiyor olabilir.
+                fc = None
+                out_errs = []
+                for out_name, out_fn in [
+                    ("GetOutput(0)",                  lambda: op.GetOutput(0)),
+                    ("outputs.fields_container.GetData()", lambda: op.outputs.fields_container.GetData()),
+                    ("Get_Output(0)",                 lambda: op.Get_Output(0)),
+                ]:
+                    try:
+                        fc = out_fn()
+                        _diag("  -> cikti '{0}' ile alindi.".format(out_name))
+                        break
+                    except Exception as ex_out:
+                        out_errs.append("{0}: {1}".format(out_name, ex_out))
+                if fc is None:
+                    _diag("  -> TUM cikti alma yontemleri basarisiz.", " | ".join(out_errs))
+        except Exception as ex:
+            _diag("  -> BAGLANTI/OKUMA BASARISIZ", str(ex))
+            op = None
+            continue
+
+        if fc is None:
+            _diag("  -> '{0}' fields_container alinamadi/None, sonrakine geciliyor.".format(cand))
+            op = None
+            continue
+
+        try: nf = fc.FieldCount
+        except:
+            try: nf = len(fc)
+            except: nf = 0
+        if nf == 0:
+            _diag("  -> '{0}' 0 field dondurdu (bu RST'de yok), sonrakine geciliyor.".format(cand))
+            op = None
+            continue
+
+        # KONTROL 1: field(lar) var ama ICLERINDE gercekten veri var mi?
+        # KONTROL 2 (ONEMLI): o verinin en az bir tanesi SIFIRDAN FARKLI mi?
+        # (artificial_hourglass_energy gibi yapisal olarak dolu ama FIZIKSEL
+        # olarak hep-sifir alanlari elemek icin.)
+        total_elem_count, nonzero_count = _field_container_nonzero_info(fc, nf)
+        if total_elem_count == 0:
+            _diag("  -> '{0}' {1} field dondurdu AMA HEPSI BOS (0 element toplam) -- "
+                 "sonraki adaya geciliyor.".format(cand, nf))
+            op = None
+            continue
+        if nonzero_count == 0:
+            _diag("  -> '{0}' {1} element verisi var AMA HEPSI SIFIR "
+                 "(bu alan bu analiz tipinde anlamli degil) -- sonraki adaya geciliyor.".format(
+                     cand, total_elem_count))
+            op = None
+            continue
+
+        used_name = cand
+        _diag("BASARILI: '{0}' -> {1} field, {2} element, {3} tanesi SIFIRDAN FARKLI.".format(
+            cand, nf, total_elem_count, nonzero_count))
+        break
+
+    if op is None or used_name is None:
+        _diag("TAMAMEN BASARISIZ: Hicbir aday sifirdan farkli gercek veri dondurmedi.")
+        _diag("*** OLASI SEBEP: Solve sirasinda 'Output Controls > Volume and "
+             "Energy = Yes' AYARI KAPALI OLABILIR. Bu ayar kapaliysa element "
+             "bazli strain energy verisi RST'ye HIC YAZILMAZ. Modeli bu ayar "
+             "acik sekilde yeniden cozup RST'yi tekrar uretmeyi deneyin. ***")
+        return None, None
+
+    result = {}
+    for fi in range(nf):
+        if _CANCEL[0]: break
+        try: field = fc[fi]
+        except: field = fc.GetFieldByIndex(fi)
+        try: sid = int(fc.GetLabelSpace(fi)["time"])
+        except:
+            try: sid = int(field.TimeId)
+            except: sid = set_ids[fi] if fi < len(set_ids) else (fi + 1)
+        try:
+            ids_raw = field.ScopingIds
+            ids = list(ids_raw) if ids_raw is not None else []
+        except:
+            try:
+                ids_raw = field.Scoping.Ids
+                ids = list(ids_raw) if ids_raw is not None else []
+            except:
+                ids = []
+        try:
+            data_raw = field.Data
+            data = list(data_raw) if data_raw is not None else []
+        except:
+            data = []
+        result[sid] = dict(zip(ids, data))
+        _diag("  Set {0}: {1} element, ornek deger[0]={2}".format(
+            sid, len(ids), data[0] if data else "yok"))
+
+    return result, used_name
+
+# =============================================================================
+# ADIM D (ALTERNATIF YONTEM): stress x strain uzerinden strain energy
+# Kaynak: kullanicinin Ansys forumunda buldugu yontem --
+#   strain_energy_density = 0.5 * dot(elastic_strain, stress)
+# Bu yontemin avantaji: elastic_strain ve stress SONUCLARI, 'Output
+# Controls > Volume and Energy' ayarindan BAGIMSIZ olarak neredeyse HER
+# ZAMAN RST'de mevcuttur -- ENG_SE gibi ozel bir enerji kaydina ihtiyac
+# duymaz. DEZAVANTAJI: sonuc bir YOGUNLUKTUR (birim hacim basina enerji),
+# TOPLAM enerji degildir -- body'ler arasi oran karsilastirmasi icin
+# elementin HACMIYLE CARPILMASI gerekir (farkli elementler farkli hacimde
+# olabilir). Bu fonksiyon mumkunse 'elemental_volume' operatoru ile bu
+# carpimini otomatik yapar; basarisiz olursa DENSITY degerleriyle devam
+# eder ve bunu acikca isaretler.
+# =============================================================================
+def step_D_stress_strain_energy(dpf, ds, dpf_model, set_ids):
+    _step("ADIM D (Alternatif Yontem): Stress x Strain ile Strain Energy")
+    _diag("Yontem: strain_energy_density = 0.5 * dot(elastic_strain, stress) "
+         "(kullanicinin Ansys forumunda buldugu yaklasim)")
+
+    energy_by_set = {}
+    location_logged = [False]
+    volume_ok = [None]   # None=henuz denenmedi, True=basarili, False=basarisiz
+
+    for sid in set_ids:
+        if _CANCEL[0]: break
+        _diag("Set {0} isleniyor...".format(sid))
+        try:
+            strain_op = dpf.operators.result.elastic_strain()
+            strain_op.inputs.data_sources.Connect(ds)
+            strain_op.inputs.time_scoping.Connect([sid])
+            try:
+                strain_op.inputs.read_cyclic.Connect(1)
+            except: pass
+            try:
+                strain_op.inputs.requested_location.Connect("Elemental")
+            except Exception as ex:
+                _diag("  -> UYARI: strain icin requested_location='Elemental' "
+                     "baglanamadi, varsayilan lokasyon kullanilacak.", str(ex))
+            strain_fc = strain_op.outputs.fields_container.GetData()
+
+            stress_op = dpf.operators.result.stress()
+            stress_op.inputs.data_sources.Connect(ds)
+            stress_op.inputs.time_scoping.Connect([sid])
+            try:
+                stress_op.inputs.read_cyclic.Connect(1)
+            except: pass
+            try:
+                stress_op.inputs.requested_location.Connect("Elemental")
+            except Exception as ex:
+                _diag("  -> UYARI: stress icin requested_location='Elemental' "
+                     "baglanamadi.", str(ex))
+            stress_fc = stress_op.outputs.fields_container.GetData()
+
+            if strain_fc is None or stress_fc is None:
+                _diag("  -> UYARI: strain veya stress fields_container None, bu set atlaniyor.")
+                continue
+
+            try: strain_field = strain_fc[0]
+            except: strain_field = strain_fc.GetFieldByIndex(0)
+            try: stress_field = stress_fc[0]
+            except: stress_field = stress_fc.GetFieldByIndex(0)
+
+            if not location_logged[0]:
+                try:
+                    _diag("  -> strain field Location: {0}".format(strain_field.Location))
+                except: pass
+                location_logged[0] = True
+
+            dot_op = dpf.operators.math.dot()
+            dot_op.inputs.fieldA.Connect(strain_field)
+            dot_op.inputs.fieldB.Connect(stress_field)
+            product_field = dot_op.outputs.field.GetData()
+
+            scale_op = dpf.operators.math.scale()
+            scale_op.inputs.field.Connect(product_field)
+            scale_op.inputs.ponderation.Connect(0.5)
+            density_field = scale_op.outputs.field.GetData()
+
+            try:
+                ids_raw = density_field.ScopingIds
+                ids = list(ids_raw) if ids_raw is not None else []
+            except:
+                ids = []
+            try:
+                data_raw = density_field.Data
+                vals = list(data_raw) if data_raw is not None else []
+            except:
+                vals = []
+
+            nonzero = sum(1 for v in vals if abs(v) > 1e-30)
+            _diag("  Set {0}: {1} deger, {2} tanesi sifirdan farkli, ornek deger[0]={3}".format(
+                sid, len(vals), nonzero, vals[0] if vals else "yok"))
+
+            elem_vals = dict(zip(ids, vals))
+
+            # Yogunluk x Hacim = TOPLAM element enerjisi (orijinal
+            # ENERGYPOTENTIAL UDR ile karsilastirilabilir olmasi icin).
+            if volume_ok[0] is not False:
+                try:
+                    vol_op = dpf.operators.result.elemental_volume()
+                    vol_op.inputs.data_sources.Connect(ds)
+                    vol_op.inputs.time_scoping.Connect([sid])
+                    try:
+                        vol_op.inputs.read_cyclic.Connect(1)
+                    except: pass
+                    vol_fc = vol_op.outputs.fields_container.GetData()
+                    vol_field = None
+                    if vol_fc is not None:
+                        try: vol_field = vol_fc[0]
+                        except: vol_field = vol_fc.GetFieldByIndex(0)
+                    if vol_field is not None:
+                        vol_ids = list(vol_field.ScopingIds)
+                        vol_vals = list(vol_field.Data)
+                        vol_map = dict(zip(vol_ids, vol_vals))
+                        elem_vals = {eid: elem_vals[eid] * vol_map.get(eid, 0.0)
+                                    for eid in elem_vals}
+                        volume_ok[0] = True
+                    else:
+                        volume_ok[0] = False
+                        _diag("  -> UYARI: elemental_volume field None, DENSITY degerleri kullanilacak.")
+                except Exception as ex:
+                    volume_ok[0] = False
+                    _diag("  -> UYARI: elemental_volume alinamadi -- DENSITY degerleri "
+                         "kullanilacak (body ORANLARI bu durumda yaniltici olabilir, "
+                         "cunku farkli elementlerin hacmi farklidir).", str(ex))
+
+            energy_by_set[sid] = elem_vals
+
+        except Exception as ex:
+            _diag("UYARI: Set {0} icin stress*strain hesaplama basarisiz".format(sid), str(ex))
+
+    if not energy_by_set:
+        _diag("TAMAMEN BASARISIZ: ADIM D hicbir set icin veri uretemedi.")
+        return None, None
+
+    if volume_ok[0]:
+        method_label = "0.5*dot(strain,stress) x elemental_volume (TOPLAM ENERJI)"
+    else:
+        method_label = "0.5*dot(strain,stress) (SADECE DENSITY -- hacim carpimi basarisiz oldu)"
+    return energy_by_set, method_label
+
+
+class RstSeTestDialog(Form):
+    def __init__(self, ns_names):
+        self.ns_names = ns_names
+        self.rst_path = ""
+        self.out_dir  = ""
+        self.body_names = []
+        self.n_sets   = 3
+
+        self.Text = "RST Strain Energy Test"
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False; self.MinimizeBox = False
+
+        base = Form().Font
+        global FONT_TITLE
+        if FONT_TITLE is None:
+            FONT_TITLE = Font(base, FontStyle.Bold)
+        self.Font = FONT_TITLE
+
+        self._build()
+
+    def _mk_grp(self, title):
+        g = GroupBox(); g.Text = title; g.Font = FONT_TITLE
+        g.Width = 540; self.Controls.Add(g)
+        return g
+
+    def _build(self):
+        # 1) RST
+        self.grp_rst = self._mk_grp("1)  RST Result File  (required)")
+        self.grp_rst.Location = Point(PAD, PAD); self.grp_rst.Height = 72
+        lbl0 = Label(); lbl0.Text = "RST:"; lbl0.Location = Point(12, 34); lbl0.Size = Size(40, 22)
+        self.grp_rst.Controls.Add(lbl0)
+        self.txt_rst = TextBox()
+        self.txt_rst.Location = Point(56, 31); self.txt_rst.Size = Size(358, 24)
+        self.txt_rst.Text = _reg_get("LastRst")
+        self.grp_rst.Controls.Add(self.txt_rst)
+        btn_rst = Button(); btn_rst.Text = "..."; btn_rst.Location = Point(422, 30); btn_rst.Size = Size(56, 26)
+        btn_rst.Click += self._on_rst_browse
+        _style_btn(btn_rst)
+        self.grp_rst.Controls.Add(btn_rst)
+
+        # 2) Bodies (2 combo, ana tooldaki gibi)
+        self.grp_body = self._mk_grp("2)  Bodies to Test  (Named Selections)")
+        self.grp_body.Location = Point(PAD, 92); self.grp_body.Height = 100
+
+        l1 = Label(); l1.Text = "Body 1:"; l1.Location = Point(14, 28); l1.Size = Size(60, 22)
+        self.grp_body.Controls.Add(l1)
+        self.combo_b1 = ComboBox()
+        self.combo_b1.Location = Point(80, 25); self.combo_b1.Size = Size(440, 24)
+        self.combo_b1.DropDownStyle = ComboBoxStyle.DropDownList
+        self.combo_b1.Items.Add("-- Select --")
+        for n in self.ns_names: self.combo_b1.Items.Add(n)
+        self.combo_b1.SelectedIndex = 0
+        _no_scroll_cmb(self.combo_b1)
+        self.grp_body.Controls.Add(self.combo_b1)
+
+        l2 = Label(); l2.Text = "Body 2:"; l2.Location = Point(14, 60); l2.Size = Size(60, 22)
+        self.grp_body.Controls.Add(l2)
+        self.combo_b2 = ComboBox()
+        self.combo_b2.Location = Point(80, 57); self.combo_b2.Size = Size(440, 24)
+        self.combo_b2.DropDownStyle = ComboBoxStyle.DropDownList
+        self.combo_b2.Items.Add("-- Select (optional) --")
+        for n in self.ns_names: self.combo_b2.Items.Add(n)
+        self.combo_b2.SelectedIndex = 0
+        _no_scroll_cmb(self.combo_b2)
+        self.grp_body.Controls.Add(self.combo_b2)
+
+        # 3) Test settings
+        self.grp_set = self._mk_grp("3)  Test Settings")
+        self.grp_set.Location = Point(PAD, 196); self.grp_set.Height = 64
+        l3 = Label(); l3.Text = "Number of sets to test:"; l3.Location = Point(14, 28); l3.Size = Size(160, 22)
+        self.grp_set.Controls.Add(l3)
+        self.txt_nsets = TextBox()
+        self.txt_nsets.Location = Point(180, 25); self.txt_nsets.Size = Size(60, 24)
+        self.txt_nsets.Text = "3"
+        self.grp_set.Controls.Add(self.txt_nsets)
+
+        # 4) Output folder
+        self.grp_out = self._mk_grp("4)  Output Folder  (report .txt will be written here)")
+        self.grp_out.Location = Point(PAD, 264); self.grp_out.Height = 64
+        lbl4 = Label(); lbl4.Text = "Folder:"; lbl4.Location = Point(12, 28); lbl4.Size = Size(52, 22)
+        self.grp_out.Controls.Add(lbl4)
+        self.txt_dir = TextBox()
+        self.txt_dir.Location = Point(66, 25); self.txt_dir.Size = Size(368, 24)
+        self.txt_dir.Text = _reg_get("LastDir")
+        self.grp_out.Controls.Add(self.txt_dir)
+        btn_dir = Button(); btn_dir.Text = "..."; btn_dir.Location = Point(442, 24); btn_dir.Size = Size(56, 26)
+        btn_dir.Click += self._on_dir_browse
+        _style_btn(btn_dir)
+        self.grp_out.Controls.Add(btn_dir)
+
+        # butonlar
+        self.btn_run = Button(); self.btn_run.Text = "Run"
+        self.btn_run.Size = Size(110, 34); self.btn_run.Font = FONT_TITLE
+        self.btn_run.Location = Point(540 - 220 + PAD, 340)
+        self.btn_run.Click += self._on_run
+        _style_btn(self.btn_run, "run")
+        self.Controls.Add(self.btn_run)
+        self.btn_cancel = Button(); self.btn_cancel.Text = "Cancel"
+        self.btn_cancel.Size = Size(100, 34)
+        self.btn_cancel.Location = Point(540 - 100 + PAD, 340)
+        self.btn_cancel.DialogResult = DialogResult.Cancel
+        _style_btn(self.btn_cancel)
+        self.Controls.Add(self.btn_cancel); self.CancelButton = self.btn_cancel
+
+        self.ClientSize = Size(540 + 2 * PAD, 392)
+
+    def _on_rst_browse(self, s, a):
+        dlg = OpenFileDialog()
+        dlg.Title  = "Select RST result file"
+        dlg.Filter = "Ansys Result (*.rst)|*.rst|All files (*.*)|*.*"
+        init = self.txt_rst.Text.strip()
+        if init and os.path.exists(os.path.dirname(init)):
+            dlg.InitialDirectory = os.path.dirname(init)
+        if dlg.ShowDialog() == DialogResult.OK:
+            self.txt_rst.Text = dlg.FileName
+            if not self.txt_dir.Text.strip():
+                self.txt_dir.Text = os.path.dirname(dlg.FileName)
+
+    def _on_dir_browse(self, s, a):
+        dlg = OpenFileDialog()
+        dlg.Title = "Select output folder"; dlg.Filter = "Folder|*.none"
+        dlg.CheckFileExists = False; dlg.CheckPathExists = True
+        dlg.ValidateNames = False; dlg.FileName = "Select folder"
+        if self.txt_dir.Text and os.path.exists(self.txt_dir.Text):
+            dlg.InitialDirectory = self.txt_dir.Text
+        if dlg.ShowDialog() == DialogResult.OK:
+            folder = os.path.dirname(dlg.FileName)
+            if not folder: folder = dlg.FileName
+            self.txt_dir.Text = folder
+
+    def _on_run(self, s, a):
+        errs = []
+        rst = self.txt_rst.Text.strip()
+        if not rst or not os.path.exists(rst):
+            errs.append("Please select a valid RST file.")
+
+        bodies = []
+        if self.combo_b1.SelectedIndex > 0:
+            bodies.append(str(self.combo_b1.SelectedItem))
+        if self.combo_b2.SelectedIndex > 0:
+            bodies.append(str(self.combo_b2.SelectedItem))
+        if not bodies:
+            errs.append("Please select at least 1 body (Named Selection).")
+
+        try:
+            nsets = int(self.txt_nsets.Text.strip()); assert nsets > 0
+        except:
+            errs.append("Number of sets to test must be a positive integer."); nsets = 3
+
+        od = self.txt_dir.Text.strip()
+        if not od:
+            errs.append("Please select an output folder.")
+
+        if errs:
+            MessageBox.Show("\n".join(errs), "Warning"); return
+
+        self.rst_path   = rst
+        self.body_names = bodies
+        self.n_sets     = nsets
+        self.out_dir    = od
+        _reg_set("LastRst", rst); _reg_set("LastDir", od)
+        self.DialogResult = DialogResult.OK; self.Close()
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def _print_result_table(label, energy_by_set, op_used, mode_list, n_sets, body_names, body_elem_ids):
+    _step("SONUC TABLOSU -- {0}  (yontem: {1})".format(label, op_used))
+    for (sid, hi, mode_local, fr) in mode_list[:n_sets]:
+        elem_vals = energy_by_set.get(sid, {})
+        all_val = sum(elem_vals.values(), 0.0)
+        line = "HI{0} M{1} (Set{2}, {3:.1f}Hz): ALL={4:.6e}".format(
+            hi, mode_local, sid, fr, all_val)
+        for name in body_names:
+            ids = body_elem_ids.get(name, set())
+            body_val = sum((elem_vals.get(eid, 0.0) for eid in ids), 0.0)
+            ratio = (body_val / all_val * 100.0) if all_val != 0 else 0.0
+            line += "  |  {0}={1:.6e} ({2:.2f}%)".format(name, body_val, ratio)
+        _log(line)
+
+def main():
+    global FONT_TITLE
+    _CANCEL[0] = False
+    base = Form().Font
+    FONT_TITLE = Font(base, FontStyle.Bold)
+
+    model = ExtAPI.DataModel.Project.Model
+    ns_names = get_ns_names(model)
+    if not ns_names:
+        MessageBox.Show("At least 1 Named Selection is required.", "Error"); return
+
+    dlg = RstSeTestDialog(ns_names)
+    if dlg.ShowDialog() != DialogResult.OK:
+        return
+
+    prog = ProgressDialog()
+    _PROG[0] = prog
+    prog.Show()
+    prog.set_step("Starting...")
+
+    _log("#" * 70)
+    _log("# RST STRAIN ENERGY TEST SCRIPTI")
+    _log("#" * 70)
+
+    body_elem_ids = None
+    mode_list = None
+    energy_c = None; op_used_c = None
+    energy_d = None; op_used_d = None
+    any_success = False
+
+    try:
+        # ---- ADIM A ----
+        body_elem_ids = step_A_resolve_elements(model, dlg.body_names)
+        if _CANCEL[0]:
+            _log(""); _log("IPTAL EDILDI (ADIM A sirasinda).")
+        elif not body_elem_ids:
+            _log(""); _log("DURDURULDU: ADIM A basarisiz oldu, devam edilemiyor.")
+        else:
+            # ---- ADIM B ----
+            dpf, ds, dpf_model, mode_list = step_B_discover_modes(dlg.rst_path)
+            if _CANCEL[0]:
+                _log(""); _log("IPTAL EDILDI (ADIM B sirasinda).")
+            elif mode_list is None:
+                _log(""); _log("DURDURULDU: ADIM B basarisiz oldu, devam edilemiyor.")
+            else:
+                test_sets = [m[0] for m in mode_list[:dlg.n_sets]]
+
+                # ---- ADIM C: dogrudan enerji operatorleri (ENG_SE vb.) ----
+                energy_c, op_used_c = step_C_read_energy(dpf, ds, dpf_model, test_sets)
+                if _CANCEL[0]:
+                    _log(""); _log("IPTAL EDILDI (ADIM C sirasinda).")
+                elif energy_c is None:
+                    _log(""); _log("ADIM C basarisiz oldu -- ADIM D (alternatif yontem) denenecek.")
+                else:
+                    any_success = True
+                    _print_result_table("YONTEM 1 (Dogrudan Enerji Operatoru)",
+                                        energy_c, op_used_c, mode_list, dlg.n_sets,
+                                        dlg.body_names, body_elem_ids)
+
+                # ---- ADIM D: stress x strain (her durumda calistir -- karsilastirma icin) ----
+                if not _CANCEL[0]:
+                    energy_d, op_used_d = step_D_stress_strain_energy(dpf, ds, dpf_model, test_sets)
+                    if _CANCEL[0]:
+                        _log(""); _log("IPTAL EDILDI (ADIM D sirasinda).")
+                    elif energy_d is None:
+                        _log(""); _log("ADIM D da basarisiz oldu.")
+                    else:
+                        any_success = True
+                        _print_result_table("YONTEM 2 (Stress x Strain)",
+                                            energy_d, op_used_d, mode_list, dlg.n_sets,
+                                            dlg.body_names, body_elem_ids)
+
+                if any_success:
+                    _log("")
+                    _log("TEST TAMAMLANDI. Yukaridaki tablo(lar) mantikli gorunuyorsa "
+                        "(oranlar toplamda ~%100'u makul sekilde paylasiyorsa), "
+                        "ilgili yontemi ana koda entegre edebiliriz. Iki yontem de "
+                        "basariliysa, degerlerin birbirine YAKIN olup olmadigina "
+                        "bakarak hangisinin daha guvenilir oldugunu teyit edebiliriz.")
+                elif not _CANCEL[0]:
+                    _log("")
+                    _log("HER IKI YONTEM DE BASARISIZ OLDU. 'Output Controls > Volume "
+                        "and Energy = Yes' ayarinin acik oldugundan ve modelin bu "
+                        "ayarla YENIDEN cozuldugunden emin olun.")
+    except Exception as ex:
+        _log("")
+        _log("BEKLENMEYEN HATA: " + str(ex))
+        import traceback
+        _log(traceback.format_exc())
+
+    prog.done()
+    prog.close_ok()
+    _PROG[0] = None
+
+    report_path = _write_report(dlg.out_dir)
+
+    if _CANCEL[0]:
+        MessageBox.Show("Islem iptal edildi.\n\nRapor (o ana kadar): " + report_path, "Iptal Edildi")
+    else:
+        MessageBox.Show("Test tamamlandi.\n\nRapor: " + report_path, "RST SE Test - Tamamlandi")
+
+def _write_report(out_dir):
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    report_path = os.path.join(out_dir, "RST_SE_Test_Report.txt")
+    with open(report_path, "w") as f:
+        f.write("\n".join(_REPORT_LINES))
+    print("Rapor yazildi: " + report_path)
+    return report_path
+
+main()
