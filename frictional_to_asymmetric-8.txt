@@ -1,0 +1,1478 @@
+# ============================================================
+# ANSYS Mechanical - User Settings
+# Kullanim: Tools > Run Script File | IronPython 2.7
+# ============================================================
+
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (
+    Form, Label, CheckBox, Button, TreeView, TreeNode,
+    MessageBox, MessageBoxButtons, MessageBoxIcon,
+    FormBorderStyle, FormStartPosition, DialogResult,
+    BorderStyle, View, ColumnHeader, ComboBox, ComboBoxStyle,
+    Panel, TextBox, Application
+)
+from System.Drawing import Size, Point, Font, FontStyle, Color
+
+FONT_NORMAL = Font("Segoe UI", 9,  FontStyle.Regular)
+FONT_GROUP  = Font("Segoe UI", 10, FontStyle.Bold)
+
+
+class NoScrollComboBox(ComboBox):
+    """IronPython 2.7 - combo uzerinde hover scroll'u engeller."""
+    def __init__(self):
+        ComboBox.__init__(self)
+        # SelectedIndexChanged oncesi ve sonrasi degerini karsilastirmak icin
+        self._last_index = -1
+        self._mouse_inside = False
+        self.MouseEnter += self._on_enter
+        self.MouseLeave += self._on_leave
+        self.DropDown    += self._on_open
+        self.DropDownClosed += self._on_close
+        self._dropped = False
+
+    def _on_enter(self, s, e): self._mouse_inside = True
+    def _on_leave(self, s, e): self._mouse_inside = False
+    def _on_open(self, s, e):  self._dropped = True
+    def _on_close(self, s, e): self._dropped = False
+
+    def WndProc(self, m):
+        # WM_MOUSEWHEEL = 0x020A
+        # Dropdown kapali iken scroll mesajini yut
+        if m.Msg == 0x020A and not self._dropped:
+            return
+        ComboBox.WndProc(self, m)
+
+
+# ============================================================
+# OUTPUT CONTROLS POPUP
+# ============================================================
+class OutputControlsForm(Form):
+
+    STORE_OPTIONS = [
+        "Last Time Point",
+        "All Time Points",
+        "Equally Spaced Points",
+        "Specified Recurrence Rate",
+    ]
+
+    def __init__(self, num_steps):
+        Form.__init__(self)
+        self.num_steps = num_steps
+        self.output_controls = []
+
+        self.Text = "Output Controls"
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.BackColor = Color.WhiteSmoke
+
+        lbl_title = Label()
+        lbl_title.Text = "Output Controls - Store Results At"
+        lbl_title.Font = Font("Segoe UI", 11, FontStyle.Bold)
+        lbl_title.Location = Point(20, 15)
+        lbl_title.Size = Size(340, 26)
+        self.Controls.Add(lbl_title)
+
+        lbl_info = Label()
+        lbl_info.Text = "Select store option per step. Leave '-- Select --' to skip."
+        lbl_info.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        lbl_info.ForeColor = Color.DimGray
+        lbl_info.Location = Point(20, 44)
+        lbl_info.Size = Size(340, 18)
+        self.Controls.Add(lbl_info)
+
+        # All Steps - sabit, scroll disinda
+        lbl_all = Label()
+        lbl_all.Text = "All Steps:"
+        lbl_all.Font = Font("Segoe UI", 9, FontStyle.Bold)
+        lbl_all.Location = Point(10, 72)
+        lbl_all.Size = Size(88, 22)
+        self.Controls.Add(lbl_all)
+
+        self.cmb_all = NoScrollComboBox()
+        self.cmb_all.Location = Point(100, 69)
+        self.cmb_all.Size = Size(250, 24)
+        self.cmb_all.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cmb_all.Font = FONT_NORMAL
+        self.cmb_all.Items.Add("-- Select --")
+        for opt in self.STORE_OPTIONS:
+            self.cmb_all.Items.Add(opt)
+        self.cmb_all.SelectedIndex = 0
+        self._all_steps_ready = False
+        self.cmb_all.SelectedIndexChanged += self.on_all_changed
+        self.Controls.Add(self.cmb_all)
+
+        # Scrollable panel - per-step satirlari icin
+        panel_h = min(num_steps * 30 + 10, 300)
+        self._panel = Panel()
+        self._panel.Location = Point(10, 99)
+        self._panel.Size = Size(360, panel_h)
+        self._panel.AutoScroll = True
+        self._panel.BorderStyle = BorderStyle.FixedSingle
+        self.Controls.Add(self._panel)
+
+        self._step_combos = []
+        y = 5
+        for s in range(1, num_steps + 1):
+            lbl_s = Label()
+            lbl_s.Text = "Step " + str(s) + ":"
+            lbl_s.Font = FONT_NORMAL
+            lbl_s.Location = Point(5, y + 3)
+            lbl_s.Size = Size(90, 22)
+            self._panel.Controls.Add(lbl_s)
+
+            cmb_s = NoScrollComboBox()
+            cmb_s.Location = Point(100, y)
+            cmb_s.Size = Size(220, 24)
+            cmb_s.DropDownStyle = ComboBoxStyle.DropDownList
+            cmb_s.Font = FONT_NORMAL
+            cmb_s.Items.Add("-- Select --")
+            for opt in self.STORE_OPTIONS:
+                cmb_s.Items.Add(opt)
+            cmb_s.SelectedIndex = 0
+            self._panel.Controls.Add(cmb_s)
+            self._step_combos.append(cmb_s)
+            y += 30
+
+        btn_y = 99 + panel_h + 12
+        btn_ok = Button()
+        btn_ok.Text = "OK"
+        btn_ok.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        btn_ok.Location = Point(50, btn_y)
+        btn_ok.Size = Size(80, 34)
+        btn_ok.BackColor = Color.SteelBlue
+        btn_ok.ForeColor = Color.White
+        btn_ok.Click += self.on_ok
+        self.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(143, btn_y)
+        btn_cancel.Size = Size(80, 34)
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        btn_back = Button()
+        btn_back.Text = "< Back"
+        btn_back.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_back.Location = Point(236, btn_y)
+        btn_back.Size = Size(80, 34)
+        btn_back.Click += self.on_cancel
+        self.Controls.Add(btn_back)
+
+        self.Size = Size(390, btn_y + 80)
+        self._all_steps_ready = True
+
+    def on_all_changed(self, sender, event):
+        if not self._all_steps_ready:
+            return
+        if self.cmb_all.SelectedIndex > 0:
+            for cmb in self._step_combos:
+                cmb.SelectedIndex = self.cmb_all.SelectedIndex
+
+    def on_ok(self, sender, event):
+        self.output_controls = [cmb.SelectedIndex for cmb in self._step_combos]
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, event):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+# ============================================================
+# CONTACT SETTINGS POPUP
+# ============================================================
+class ContactSettingsForm(Form):
+
+    def __init__(self):
+        Form.__init__(self)
+        self.selected_contacts = []
+        self._ordered_nodes    = []  # (TreeNode, contact)
+        self._group_nodes      = []
+        self._updating         = False
+
+        self.Text = "Contact Settings"
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.BackColor = Color.WhiteSmoke
+
+        lbl_title = Label()
+        lbl_title.Text = "Contact Settings"
+        lbl_title.Font = Font("Segoe UI", 11, FontStyle.Bold)
+        lbl_title.Location = Point(20, 15)
+        lbl_title.Size = Size(380, 26)
+        self.Controls.Add(lbl_title)
+
+        lbl_info = Label()
+        lbl_info.Text = "Frictional: Asymmetric, Pure Penalty, Factor,\nEach Iteration, Pen. Tol. = 0.003\nBonded: Asymmetric, Pure Penalty"
+        lbl_info.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        lbl_info.ForeColor = Color.DimGray
+        lbl_info.Location = Point(20, 44)
+        lbl_info.Size = Size(380, 50)
+        self.Controls.Add(lbl_info)
+
+        # Select All / Clear butonlari
+        btn_all = Button()
+        btn_all.Text = "Select All"
+        btn_all.Font = FONT_NORMAL
+        btn_all.Location = Point(20, 100)
+        btn_all.Size = Size(90, 24)
+        btn_all.Click += self.on_select_all
+        self.Controls.Add(btn_all)
+
+        btn_clear = Button()
+        btn_clear.Text = "Clear All"
+        btn_clear.Font = FONT_NORMAL
+        btn_clear.Location = Point(120, 100)
+        btn_clear.Size = Size(90, 24)
+        btn_clear.Click += self.on_clear_all
+        self.Controls.Add(btn_clear)
+
+        # TreeView
+        self.tv = TreeView()
+        self.tv.Location      = Point(20, 130)
+        self.tv.Size          = Size(380, 255)
+        self.tv.CheckBoxes    = True
+        self.tv.ShowLines     = True
+        self.tv.ShowPlusMinus = True
+        self.tv.ShowRootLines = True
+        self.tv.Scrollable    = True
+        self.tv.AfterCheck   += self.on_node_check
+        self.Controls.Add(self.tv)
+
+        btn_ok = Button()
+        btn_ok.Text = "OK"
+        btn_ok.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        btn_ok.Location = Point(50, 400)
+        btn_ok.Size = Size(80, 34)
+        btn_ok.BackColor = Color.SteelBlue
+        btn_ok.ForeColor = Color.White
+        btn_ok.Click += self.on_ok
+        self.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(143, 400)
+        btn_cancel.Size = Size(80, 34)
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        btn_back = Button()
+        btn_back.Text = "< Back"
+        btn_back.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_back.Location = Point(236, 400)
+        btn_back.Size = Size(80, 34)
+        btn_back.Click += self.on_cancel
+        self.Controls.Add(btn_back)
+
+        self.Size = Size(430, 480)
+        self.load_contacts()
+
+    def load_contacts(self):
+        self.tv.Nodes.Clear()
+        self._ordered_nodes = []
+        self._group_nodes   = []
+
+        def add_contact_node(contact, parent_node):
+            ctype = str(contact.ContactType)
+            label = contact.Name + "  [" + ctype + "]"
+            node = TreeNode(label)
+            node.Tag      = "CONTACT"
+            node.NodeFont = FONT_NORMAL
+            parent_node.Nodes.Add(node)
+            self._ordered_nodes.append((node, contact))
+
+        def add_group_node(name, parent=None):
+            node = TreeNode(name)
+            node.Tag      = "GROUP"
+            node.NodeFont = FONT_GROUP
+            if parent is None:
+                self.tv.Nodes.Add(node)
+            else:
+                parent.Nodes.Add(node)
+            self._group_nodes.append(node)
+            return node
+
+        try:
+            connections = ExtAPI.DataModel.Project.Model.Connections
+            for top in connections.Children:
+                try:
+                    top_type = top.GetType().Name
+                    if top_type == "ContactRegion":
+                        # Grupsuz contact - dogrudan root'a
+                        node = TreeNode(top.Name + "  [" + str(top.ContactType) + "]")
+                        node.Tag      = "CONTACT"
+                        node.NodeFont = FONT_NORMAL
+                        self.tv.Nodes.Add(node)
+                        self._ordered_nodes.append((node, top))
+                    elif top_type == "ConnectionGroup":
+                        # ConnectionGroup'u grup olarak goster
+                        g_node = add_group_node(top.Name + "  [" + str(top.Children.Count) + " contacts]")
+                        for child in top.Children:
+                            try:
+                                child_type = child.GetType().Name
+                                if child_type == "ContactRegion":
+                                    add_contact_node(child, g_node)
+                                elif child_type == "TreeGroupingFolder":
+                                    sub_node = add_group_node(child.Name, g_node)
+                                    for gc in child.Children:
+                                        try:
+                                            if gc.GetType().Name == "ContactRegion":
+                                                add_contact_node(gc, sub_node)
+                                        except:
+                                            pass
+                                    sub_node.Expand()
+                            except:
+                                pass
+                        g_node.Expand()
+                except:
+                    pass
+        except Exception as ex:
+            print("load_contacts HATA: " + str(ex))
+
+    def on_node_check(self, sender, event):
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            node = event.Node
+            if str(node.Tag) == "GROUP":
+                for child in node.Nodes:
+                    child.Checked = node.Checked
+                    if str(child.Tag) == "GROUP":
+                        for gc in child.Nodes:
+                            gc.Checked = node.Checked
+            elif str(node.Tag) == "CONTACT":
+                parent = node.Parent
+                if parent is not None:
+                    all_checked = all(c.Checked for c in parent.Nodes)
+                    parent.Checked = all_checked
+        finally:
+            self._updating = False
+
+    def on_select_all(self, sender, event):
+        self._updating = True
+        try:
+            for g_node in self._group_nodes:
+                g_node.Checked = True
+                for child in g_node.Nodes:
+                    child.Checked = True
+            for node, contact in self._ordered_nodes:
+                node.Checked = True
+        finally:
+            self._updating = False
+
+    def on_clear_all(self, sender, event):
+        self._updating = True
+        try:
+            for g_node in self._group_nodes:
+                g_node.Checked = False
+                for child in g_node.Nodes:
+                    child.Checked = False
+            for node, contact in self._ordered_nodes:
+                node.Checked = False
+        finally:
+            self._updating = False
+
+    def on_ok(self, sender, event):
+        self.selected_contacts = []
+        for node, contact in self._ordered_nodes:
+            if node.Checked:
+                self.selected_contacts.append(contact)
+        if len(self.selected_contacts) == 0:
+            MessageBox.Show(
+                "Please select at least one contact or use 'Select All'.",
+                "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+            )
+            return
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, event):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+# ============================================================
+# FORCE CONVERGENCE POPUP
+# ============================================================
+class ForceConvergenceForm(Form):
+
+    def __init__(self, num_steps):
+        Form.__init__(self)
+        self.num_steps = num_steps
+        self.step_values = []
+
+        self.Text = "Force Convergence Value"
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.BackColor = Color.WhiteSmoke
+
+        lbl_title = Label()
+        lbl_title.Text = "Force Convergence Value"
+        lbl_title.Font = Font("Segoe UI", 11, FontStyle.Bold)
+        lbl_title.Location = Point(20, 15)
+        lbl_title.Size = Size(480, 26)
+        self.Controls.Add(lbl_title)
+
+        lbl_info = Label()
+        lbl_info.Text = "Leave fields empty to skip a step."
+        lbl_info.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        lbl_info.ForeColor = Color.DimGray
+        lbl_info.Location = Point(20, 44)
+        lbl_info.Size = Size(480, 18)
+        self.Controls.Add(lbl_info)
+
+        # X koordinatlari - tum satirlar ayni hizada
+        X_LBL  = 10
+        X_VAL  = 70
+        X_TOL  = 195
+        X_MIN  = 320
+
+        # Header labels - sabit
+        for text, x in [("Value (N)", X_VAL), ("Tolerance (%)", X_TOL), ("Min Reference (N)", X_MIN)]:
+            lbl = Label()
+            lbl.Text = text
+            lbl.Font = Font("Segoe UI", 8, FontStyle.Bold)
+            lbl.Location = Point(x, 68)
+            lbl.Size = Size(115, 18)
+            self.Controls.Add(lbl)
+
+        # Apply All row - sabit, en uste
+        lbl_all = Label()
+        lbl_all.Text = "All Steps:"
+        lbl_all.Font = Font("Segoe UI", 9, FontStyle.Bold)
+        lbl_all.Location = Point(X_LBL, 92)
+        lbl_all.Size = Size(58, 22)
+        self.Controls.Add(lbl_all)
+
+        self._txt_all_val = TextBox()
+        self._txt_all_val.Location = Point(X_VAL, 89)
+        self._txt_all_val.Size = Size(115, 22)
+        self._txt_all_val.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_val)
+
+        self._txt_all_tol = TextBox()
+        self._txt_all_tol.Location = Point(X_TOL, 89)
+        self._txt_all_tol.Size = Size(115, 22)
+        self._txt_all_tol.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_tol)
+
+        self._txt_all_min = TextBox()
+        self._txt_all_min.Location = Point(X_MIN, 89)
+        self._txt_all_min.Size = Size(115, 22)
+        self._txt_all_min.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_min)
+
+        btn_apply_all = Button()
+        btn_apply_all.Text = "Apply to All"
+        btn_apply_all.Font = Font("Segoe UI", 8, FontStyle.Regular)
+        btn_apply_all.Location = Point(445, 88)
+        btn_apply_all.Size = Size(85, 24)
+        btn_apply_all.Click += self.on_apply_all
+        self.Controls.Add(btn_apply_all)
+
+        # Scrollable panel - per-step satirlari (All Steps'in altinda, aralik biraz fazla)
+        panel_h = min(num_steps * 30 + 10, 280)
+        self._panel = Panel()
+        self._panel.Location = Point(10, 122)
+        self._panel.Size = Size(520, panel_h)
+        self._panel.AutoScroll = True
+        self._panel.BorderStyle = BorderStyle.FixedSingle
+        self.Controls.Add(self._panel)
+
+        self._rows = []
+        y = 5
+        for s in range(1, num_steps + 1):
+            lbl_s = Label()
+            lbl_s.Text = "Step " + str(s) + ":"
+            lbl_s.Font = FONT_NORMAL
+            lbl_s.Location = Point(X_LBL - 10 + 5, y + 3)
+            lbl_s.Size = Size(55, 20)
+            self._panel.Controls.Add(lbl_s)
+
+            txt_val = TextBox()
+            txt_val.Location = Point(X_VAL - 10, y)
+            txt_val.Size = Size(115, 22)
+            txt_val.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_val)
+
+            txt_tol = TextBox()
+            txt_tol.Location = Point(X_TOL - 10, y)
+            txt_tol.Size = Size(115, 22)
+            txt_tol.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_tol)
+
+            txt_min = TextBox()
+            txt_min.Location = Point(X_MIN - 10, y)
+            txt_min.Size = Size(115, 22)
+            txt_min.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_min)
+
+            self._rows.append((txt_val, txt_tol, txt_min))
+            y += 30
+
+        btn_y = 122 + panel_h + 12
+        btn_ok = Button()
+        btn_ok.Text = "OK"
+        btn_ok.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        btn_ok.Location = Point(120, btn_y)
+        btn_ok.Size = Size(80, 34)
+        btn_ok.BackColor = Color.SteelBlue
+        btn_ok.ForeColor = Color.White
+        btn_ok.Click += self.on_ok
+        self.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(213, btn_y)
+        btn_cancel.Size = Size(80, 34)
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        btn_back = Button()
+        btn_back.Text = "< Back"
+        btn_back.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_back.Location = Point(306, btn_y)
+        btn_back.Size = Size(80, 34)
+        btn_back.Click += self.on_cancel
+        self.Controls.Add(btn_back)
+
+        self.Size = Size(550, btn_y + 80)
+
+    def on_apply_all(self, sender, event):
+        v = self._txt_all_val.Text.strip()
+        t = self._txt_all_tol.Text.strip()
+        m = self._txt_all_min.Text.strip()
+        for txt_val, txt_tol, txt_min in self._rows:
+            if v: txt_val.Text = v
+            if t: txt_tol.Text = t
+            if m: txt_min.Text = m
+
+    def _parse_float(self, txt):
+        s = txt.strip().replace(",", ".")
+        if not s:
+            return None
+        try:
+            return float(s)
+        except:
+            return None
+
+    def on_ok(self, sender, event):
+        self.step_values = []
+        for txt_val, txt_tol, txt_min in self._rows:
+            v = self._parse_float(txt_val.Text)
+            t = self._parse_float(txt_tol.Text)
+            m = self._parse_float(txt_min.Text)
+            if v is None and t is None and m is None:
+                self.step_values.append(None)
+            else:
+                self.step_values.append((v, t, m))
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, event):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+
+# ============================================================
+# SUBSTEP SETTINGS POPUP
+# ============================================================
+class SubstepForm(Form):
+
+    def __init__(self, num_steps):
+        Form.__init__(self)
+        self.num_steps = num_steps
+        self.step_values = []  # list of (initial, minimum, maximum) per step, None if skipped
+
+        self.Text = "Substep Settings"
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.BackColor = Color.WhiteSmoke
+
+        lbl_title = Label()
+        lbl_title.Text = "Substep Settings"
+        lbl_title.Font = Font("Segoe UI", 11, FontStyle.Bold)
+        lbl_title.Location = Point(20, 15)
+        lbl_title.Size = Size(480, 26)
+        self.Controls.Add(lbl_title)
+
+        lbl_info = Label()
+        lbl_info.Text = "Leave fields empty to skip a step."
+        lbl_info.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        lbl_info.ForeColor = Color.DimGray
+        lbl_info.Location = Point(20, 44)
+        lbl_info.Size = Size(480, 18)
+        self.Controls.Add(lbl_info)
+
+        X_LBL = 10
+        X_INI = 70
+        X_MIN = 195
+        X_MAX = 320
+
+        # Header labels
+        for text, x in [("Initial", X_INI), ("Minimum", X_MIN), ("Maximum", X_MAX)]:
+            lbl = Label()
+            lbl.Text = text
+            lbl.Font = Font("Segoe UI", 8, FontStyle.Bold)
+            lbl.Location = Point(x, 68)
+            lbl.Size = Size(115, 18)
+            self.Controls.Add(lbl)
+
+        # Apply All row
+        lbl_all = Label()
+        lbl_all.Text = "All Steps:"
+        lbl_all.Font = Font("Segoe UI", 9, FontStyle.Bold)
+        lbl_all.Location = Point(X_LBL, 92)
+        lbl_all.Size = Size(58, 22)
+        self.Controls.Add(lbl_all)
+
+        self._txt_all_ini = TextBox()
+        self._txt_all_ini.Location = Point(X_INI, 89)
+        self._txt_all_ini.Size = Size(115, 22)
+        self._txt_all_ini.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_ini)
+
+        self._txt_all_min = TextBox()
+        self._txt_all_min.Location = Point(X_MIN, 89)
+        self._txt_all_min.Size = Size(115, 22)
+        self._txt_all_min.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_min)
+
+        self._txt_all_max = TextBox()
+        self._txt_all_max.Location = Point(X_MAX, 89)
+        self._txt_all_max.Size = Size(115, 22)
+        self._txt_all_max.Font = FONT_NORMAL
+        self.Controls.Add(self._txt_all_max)
+
+        btn_apply_all = Button()
+        btn_apply_all.Text = "Apply to All"
+        btn_apply_all.Font = Font("Segoe UI", 8, FontStyle.Regular)
+        btn_apply_all.Location = Point(445, 88)
+        btn_apply_all.Size = Size(85, 24)
+        btn_apply_all.Click += self.on_apply_all
+        self.Controls.Add(btn_apply_all)
+
+        # Scrollable panel
+        panel_h = min(num_steps * 30 + 10, 280)
+        self._panel = Panel()
+        self._panel.Location = Point(10, 122)
+        self._panel.Size = Size(520, panel_h)
+        self._panel.AutoScroll = True
+        self._panel.BorderStyle = BorderStyle.FixedSingle
+        self.Controls.Add(self._panel)
+
+        self._rows = []
+        y = 5
+        for s in range(1, num_steps + 1):
+            lbl_s = Label()
+            lbl_s.Text = "Step " + str(s) + ":"
+            lbl_s.Font = FONT_NORMAL
+            lbl_s.Location = Point(X_LBL - 5, y + 3)
+            lbl_s.Size = Size(55, 20)
+            self._panel.Controls.Add(lbl_s)
+
+            txt_ini = TextBox()
+            txt_ini.Location = Point(X_INI - 10, y)
+            txt_ini.Size = Size(115, 22)
+            txt_ini.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_ini)
+
+            txt_min = TextBox()
+            txt_min.Location = Point(X_MIN - 10, y)
+            txt_min.Size = Size(115, 22)
+            txt_min.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_min)
+
+            txt_max = TextBox()
+            txt_max.Location = Point(X_MAX - 10, y)
+            txt_max.Size = Size(115, 22)
+            txt_max.Font = FONT_NORMAL
+            self._panel.Controls.Add(txt_max)
+
+            self._rows.append((txt_ini, txt_min, txt_max))
+            y += 30
+
+        btn_y = 122 + panel_h + 12
+
+        btn_ok = Button()
+        btn_ok.Text = "OK"
+        btn_ok.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        btn_ok.Location = Point(120, btn_y)
+        btn_ok.Size = Size(80, 34)
+        btn_ok.BackColor = Color.SteelBlue
+        btn_ok.ForeColor = Color.White
+        btn_ok.Click += self.on_ok
+        self.Controls.Add(btn_ok)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(213, btn_y)
+        btn_cancel.Size = Size(80, 34)
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        btn_back = Button()
+        btn_back.Text = "< Back"
+        btn_back.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_back.Location = Point(306, btn_y)
+        btn_back.Size = Size(80, 34)
+        btn_back.Click += self.on_cancel
+        self.Controls.Add(btn_back)
+
+        self.Size = Size(550, btn_y + 80)
+
+    def on_apply_all(self, sender, event):
+        ini = self._txt_all_ini.Text.strip()
+        mn  = self._txt_all_min.Text.strip()
+        mx  = self._txt_all_max.Text.strip()
+        for txt_ini, txt_min, txt_max in self._rows:
+            if ini: txt_ini.Text = ini
+            if mn:  txt_min.Text = mn
+            if mx:  txt_max.Text = mx
+
+    def _parse_int(self, txt):
+        s = txt.strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except:
+            return None
+
+    def on_ok(self, sender, event):
+        self.step_values = []
+        for txt_ini, txt_min, txt_max in self._rows:
+            ini = self._parse_int(txt_ini.Text)
+            mn  = self._parse_int(txt_min.Text)
+            mx  = self._parse_int(txt_max.Text)
+            if ini is None and mn is None and mx is None:
+                self.step_values.append(None)
+            else:
+                self.step_values.append((ini, mn, mx))
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, event):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+
+
+    def __init__(self):
+        Form.__init__(self)
+        self.large_deflection_on  = None
+        self.output_controls      = []
+        self.selected_contacts    = []
+        self.force_convergence    = []
+        self.substep_settings     = []
+        self._ss_configured       = False
+        self.selected_analyses    = []
+        self._oc_configured       = False
+        self._cs_configured       = False
+        self._fc_configured       = False
+
+        self.Text = "User Settings"
+        self.Size = Size(360, 370)
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.BackColor = Color.WhiteSmoke
+
+        lbl_title = Label()
+        lbl_title.Text = "User Settings"
+        lbl_title.Font = Font("Segoe UI", 12, FontStyle.Bold)
+        lbl_title.Location = Point(20, 15)
+        lbl_title.Size = Size(310, 28)
+        self.Controls.Add(lbl_title)
+
+        # --- Analysis Selection ---
+        lbl_ana = Label()
+        lbl_ana.Text = "Analysis:"
+        lbl_ana.Font = Font("Segoe UI", 9, FontStyle.Bold)
+        lbl_ana.Location = Point(20, 52)
+        lbl_ana.Size = Size(75, 22)
+        self.Controls.Add(lbl_ana)
+
+        # Analizleri yukle
+        self._analyses = []
+        try:
+            self._analyses = list(ExtAPI.DataModel.Project.Model.Analyses)
+        except:
+            pass
+
+        self._ana_cmb = NoScrollComboBox()
+        self._ana_cmb.Location = Point(100, 49)
+        self._ana_cmb.Size = Size(220, 24)
+        self._ana_cmb.DropDownStyle = ComboBoxStyle.DropDownList
+        self._ana_cmb.Font = FONT_NORMAL
+
+        for a in self._analyses:
+            try:
+                atype = str(a.AnalysisType)
+            except:
+                atype = "Unknown"
+            self._ana_cmb.Items.Add(a.Name + "  [" + atype + "]")
+
+        if len(self._analyses) > 0:
+            self._ana_cmb.SelectedIndex = 0
+
+        self.Controls.Add(self._ana_cmb)
+
+        # Tum kontrollerin Y offseti
+        clb_h = 30
+        Y = 52 + clb_h + 12
+
+        # --- Large Deflection ---
+        lbl_ld = Label()
+        lbl_ld.Text = "Large Deflection:"
+        lbl_ld.Font = Font("Segoe UI", 9, FontStyle.Bold)
+        lbl_ld.Location = Point(20, Y)
+        lbl_ld.Size = Size(135, 22)
+        self.Controls.Add(lbl_ld)
+
+        self.cmb_ld = NoScrollComboBox()
+        self.cmb_ld.Location = Point(160, Y - 3)
+        self.cmb_ld.Size = Size(155, 24)
+        self.cmb_ld.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cmb_ld.Font = FONT_NORMAL
+        self.cmb_ld.Items.Add("On")
+        self.cmb_ld.Items.Add("Off")
+        self.cmb_ld.SelectedIndex = -1
+        self.Controls.Add(self.cmb_ld)
+        Y += 35
+
+        # --- Output Controls ---
+        self.chk_oc = CheckBox()
+        self.chk_oc.Text = "Output Controls"
+        self.chk_oc.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        self.chk_oc.Location = Point(20, Y)
+        self.chk_oc.Size = Size(295, 22)
+        self.chk_oc.Checked = False
+        self.chk_oc.Click += self.on_open_oc
+        self.Controls.Add(self.chk_oc)
+        Y += 22
+
+        self.lbl_oc_status = Label()
+        self.lbl_oc_status.Text = ""
+        self.lbl_oc_status.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        self.lbl_oc_status.ForeColor = Color.SeaGreen
+        self.lbl_oc_status.Location = Point(38, Y)
+        self.lbl_oc_status.Size = Size(277, 16)
+        self.Controls.Add(self.lbl_oc_status)
+        Y += 22
+
+        # --- Contact Settings ---
+        self.chk_cs = CheckBox()
+        self.chk_cs.Text = "Contact Settings"
+        self.chk_cs.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        self.chk_cs.Location = Point(20, Y)
+        self.chk_cs.Size = Size(295, 22)
+        self.chk_cs.Checked = False
+        self.chk_cs.Click += self.on_open_cs
+        self.Controls.Add(self.chk_cs)
+        Y += 22
+
+        self.lbl_cs_status = Label()
+        self.lbl_cs_status.Text = ""
+        self.lbl_cs_status.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        self.lbl_cs_status.ForeColor = Color.SeaGreen
+        self.lbl_cs_status.Location = Point(38, Y)
+        self.lbl_cs_status.Size = Size(277, 16)
+        self.Controls.Add(self.lbl_cs_status)
+        Y += 22
+
+        # --- Force Convergence ---
+        self.chk_fc = CheckBox()
+        self.chk_fc.Text = "Force Convergence Value"
+        self.chk_fc.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        self.chk_fc.Location = Point(20, Y)
+        self.chk_fc.Size = Size(295, 22)
+        self.chk_fc.Checked = False
+        self.chk_fc.Click += self.on_open_fc
+        self.Controls.Add(self.chk_fc)
+        Y += 22
+
+        self.lbl_fc_status = Label()
+        self.lbl_fc_status.Text = ""
+        self.lbl_fc_status.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        self.lbl_fc_status.ForeColor = Color.SeaGreen
+        self.lbl_fc_status.Location = Point(38, Y)
+        self.lbl_fc_status.Size = Size(277, 16)
+        self.Controls.Add(self.lbl_fc_status)
+        Y += 22
+
+        # --- Substep Settings ---
+        self.chk_ss = CheckBox()
+        self.chk_ss.Text = "Substep Settings"
+        self.chk_ss.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        self.chk_ss.Location = Point(20, Y)
+        self.chk_ss.Size = Size(295, 22)
+        self.chk_ss.Checked = False
+        self.chk_ss.Click += self.on_open_ss
+        self.Controls.Add(self.chk_ss)
+        Y += 22
+
+        self.lbl_ss_status = Label()
+        self.lbl_ss_status.Text = ""
+        self.lbl_ss_status.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        self.lbl_ss_status.ForeColor = Color.SeaGreen
+        self.lbl_ss_status.Location = Point(38, Y)
+        self.lbl_ss_status.Size = Size(277, 16)
+        self.Controls.Add(self.lbl_ss_status)
+        Y += 28
+
+        # --- Run / Cancel - ortali ---
+        FORM_W = 360
+        btn_w = 85
+        gap = 20
+        total_w = btn_w * 2 + gap
+        btn_x = (FORM_W - total_w) / 2
+
+        btn_run = Button()
+        btn_run.Text = "Run"
+        btn_run.Font = Font("Segoe UI", 10, FontStyle.Bold)
+        btn_run.Location = Point(int(btn_x), Y)
+        btn_run.Size = Size(btn_w, 34)
+        btn_run.BackColor = Color.SteelBlue
+        btn_run.ForeColor = Color.White
+        btn_run.Click += self.on_run
+        self.Controls.Add(btn_run)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(int(btn_x) + btn_w + gap, Y)
+        btn_cancel.Size = Size(btn_w, 34)
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        self.Size = Size(FORM_W, Y + 75)
+
+    def _on_ana_all(self, sender, event):
+        pass  # Artık kullanılmıyor
+
+    def on_open_oc(self, sender, event):
+        # Eger zaten isaretliyse ve tekrar tiklandi -> sifirla
+        if not self.chk_oc.Checked:
+            self.output_controls = []
+            self.lbl_oc_status.Text = ""
+            self._oc_configured = False
+            return
+        # Popup ac
+        self.chk_oc.Checked = False  # popup sonucuna gore set edilecek
+        num_steps = 1
+        try:
+            num_steps = ExtAPI.DataModel.Project.Model.Analyses[0].AnalysisSettings.NumberOfSteps
+        except:
+            pass
+        oc_form = OutputControlsForm(num_steps)
+        if self.output_controls:
+            for i, val in enumerate(self.output_controls):
+                if i < len(oc_form._step_combos):
+                    oc_form._step_combos[i].SelectedIndex = val
+        if oc_form.ShowDialog() == DialogResult.OK:
+            self.output_controls = oc_form.output_controls
+            configured = sum(1 for v in self.output_controls if v > 0)
+            self.lbl_oc_status.Text = str(configured) + " step(s) configured"
+            self.chk_oc.Checked = True
+            self._oc_configured = True
+        else:
+            self.chk_oc.Checked = False
+            self._oc_configured = False
+
+    def on_open_cs(self, sender, event):
+        # Eger zaten isaretliyse ve tekrar tiklandi -> sifirla
+        if not self.chk_cs.Checked:
+            self.selected_contacts = []
+            self.lbl_cs_status.Text = ""
+            self._cs_configured = False
+            return
+        # Popup ac
+        self.chk_cs.Checked = False
+        cs_form = ContactSettingsForm()
+        if cs_form.ShowDialog() == DialogResult.OK:
+            self.selected_contacts = cs_form.selected_contacts
+            self.lbl_cs_status.Text = str(len(self.selected_contacts)) + " contact(s) selected"
+            self.chk_cs.Checked = True
+            self._cs_configured = True
+        else:
+            self.chk_cs.Checked = False
+            self._cs_configured = False
+
+    def on_open_fc(self, sender, event):
+        if not self.chk_fc.Checked:
+            self.force_convergence = []
+            self.lbl_fc_status.Text = ""
+            self._fc_configured = False
+            return
+        self.chk_fc.Checked = False
+        num_steps = 1
+        try:
+            num_steps = ExtAPI.DataModel.Project.Model.Analyses[0].AnalysisSettings.NumberOfSteps
+        except:
+            pass
+        fc_form = ForceConvergenceForm(num_steps)
+        # Onceki degerleri geri yukle
+        if self.force_convergence:
+            for i, row_val in enumerate(self.force_convergence):
+                if i < len(fc_form._rows) and row_val is not None:
+                    v, t, m = row_val
+                    txt_val, txt_tol, txt_min = fc_form._rows[i]
+                    if v is not None: txt_val.Text = str(v)
+                    if t is not None: txt_tol.Text = str(t)
+                    if m is not None: txt_min.Text = str(m)
+        if fc_form.ShowDialog() == DialogResult.OK:
+            self.force_convergence = fc_form.step_values
+            configured = sum(1 for v in self.force_convergence if v is not None)
+            self.lbl_fc_status.Text = str(configured) + " step(s) configured"
+            self.chk_fc.Checked = True
+            self._fc_configured = True
+        else:
+            self.chk_fc.Checked = False
+            self._fc_configured = False
+
+    def on_open_ss(self, sender, event):
+        if not self.chk_ss.Checked:
+            self.substep_settings = []
+            self.lbl_ss_status.Text = ""
+            self._ss_configured = False
+            return
+        self.chk_ss.Checked = False
+        num_steps = 1
+        try:
+            num_steps = ExtAPI.DataModel.Project.Model.Analyses[0].AnalysisSettings.NumberOfSteps
+        except:
+            pass
+        ss_form = SubstepForm(num_steps)
+        if self.substep_settings:
+            for i, row in enumerate(self.substep_settings):
+                if i < len(ss_form._rows) and row is not None:
+                    ini, mn, mx = row
+                    txt_ini, txt_min, txt_max = ss_form._rows[i]
+                    if ini is not None: txt_ini.Text = str(ini)
+                    if mn  is not None: txt_min.Text = str(mn)
+                    if mx  is not None: txt_max.Text = str(mx)
+        if ss_form.ShowDialog() == DialogResult.OK:
+            self.substep_settings = ss_form.step_values
+            configured = sum(1 for v in self.substep_settings if v is not None)
+            self.lbl_ss_status.Text = str(configured) + " step(s) configured"
+            self.chk_ss.Checked = True
+            self._ss_configured = True
+        else:
+            self.chk_ss.Checked = False
+            self._ss_configured = False
+
+    def on_run(self, sender, event):
+        # Analiz secimi kontrol
+        self.selected_analyses = []
+        idx = self._ana_cmb.SelectedIndex
+        if idx < 0 or idx >= len(self._analyses):
+            MessageBox.Show(
+                "Please select an analysis.",
+                "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+            )
+            return
+        self.selected_analyses = [self._analyses[idx]]
+        if self.cmb_ld.SelectedIndex == -1:
+            MessageBox.Show(
+                "Please select a Large Deflection setting (On or Off).",
+                "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+            )
+            return
+        self.large_deflection_on = (self.cmb_ld.SelectedIndex == 0)
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, event):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+# ============================================================
+# APPLY FUNCTIONS
+# ============================================================
+def apply_force_convergence(force_convergence):
+    summary = []
+    changed = 0
+    try:
+        model = ExtAPI.DataModel.Project.Model
+        for analysis in model.Analyses:
+            settings = analysis.AnalysisSettings
+            for step_idx, row_val in enumerate(force_convergence):
+                if row_val is None:
+                    continue
+                step_num = step_idx + 1
+                v, t, m = row_val
+                with Transaction(True):
+                    settings.CurrentStepNumber = step_num
+                    # Force convergence'i aktif et
+                    settings.PropertyByAPIName("ForceConvergence").InternalValue = 1
+                    if v is not None:
+                        settings.PropertyByAPIName("ForceConvergenceValue").InternalValue = v
+                    if t is not None:
+                        settings.PropertyByAPIName("ForceConvergenceTolerance").InternalValue = t
+                    if m is not None:
+                        settings.PropertyByAPIName("ForceConvergenceMinimumReference").InternalValue = m
+                print("Step " + str(step_num) + " Force Convergence set.")
+                changed += 1
+        if changed > 0:
+            summary.append("Force Convergence: " + str(changed) + " step(s) updated.")
+    except Exception as ex:
+        print("Force Convergence HATA: " + str(ex))
+        summary.append("Force Convergence: ERROR - " + str(ex))
+    return summary
+
+
+def apply_substep_settings(substep_settings, analyses):
+    summary = []
+    changed = 0
+    try:
+        for analysis in analyses:
+            settings = analysis.AnalysisSettings
+            for step_idx, row in enumerate(substep_settings):
+                if row is None:
+                    continue
+                ini, mn, mx = row
+                step_num = step_idx + 1
+                with Transaction(True):
+                    settings.CurrentStepNumber = step_num
+                    if ini is not None:
+                        settings.PropertyByAPIName("InitialSubsteps").InternalValue = ini
+                    if mn is not None:
+                        settings.PropertyByAPIName("MinimumSubsteps").InternalValue = mn
+                    if mx is not None:
+                        settings.PropertyByAPIName("MaximumSubsteps").InternalValue = mx
+                print("Step " + str(step_num) + " Substeps set.")
+                changed += 1
+        if changed > 0:
+            summary.append("Substep Settings: " + str(changed) + " step(s) updated.")
+    except Exception as ex:
+        print("Substep HATA: " + str(ex))
+        summary.append("Substep Settings: ERROR - " + str(ex))
+    return summary
+
+
+def apply_large_deflection(ld_on, analyses):
+    summary = []
+    try:
+        for analysis in analyses:
+            analysis.AnalysisSettings.LargeDeflection = ld_on
+        state = "On" if ld_on else "Off"
+        print("Large Deflection set to: " + state)
+        summary.append("Large Deflection: " + state)
+    except Exception as ex:
+        print("Large Deflection HATA: " + str(ex))
+        summary.append("Large Deflection: ERROR - " + str(ex))
+    return summary
+
+
+def apply_per_step_settings(output_controls, force_convergence):
+    """Output controls ve force convergence'i her step icin tek seferde uygular."""
+    option_map   = {1: 1, 2: 0, 3: 2, 4: 3}
+    option_names = {1: "Last Time Point", 2: "All Time Points", 3: "Equally Spaced Points", 4: "Specified Recurrence Rate"}
+    summary = []
+    oc_changed = 0
+    fc_changed = 0
+
+    # Step sayisini belirle
+    num_steps = max(len(output_controls), len(force_convergence))
+
+    try:
+        model = ExtAPI.DataModel.Project.Model
+        for analysis in model.Analyses:
+            settings = analysis.AnalysisSettings
+            for step_idx in range(num_steps):
+                oc_sel  = output_controls[step_idx]  if step_idx < len(output_controls)  else 0
+                fc_row  = force_convergence[step_idx] if step_idx < len(force_convergence) else None
+                has_oc  = (oc_sel != 0)
+                has_fc  = (fc_row is not None)
+                if not has_oc and not has_fc:
+                    continue
+                step_num = step_idx + 1
+                with Transaction(True):
+                    settings.CurrentStepNumber = step_num
+                    if has_oc:
+                        val = option_map[oc_sel]
+                        settings.PropertyByAPIName("StoreResultsAt").InternalValue = val
+                        print("Step " + str(step_num) + " StoreResultsAt -> " + option_names[oc_sel])
+                        oc_changed += 1
+                    if has_fc:
+                        v, t, m = fc_row
+                        settings.PropertyByAPIName("ForceConvergence").InternalValue = 1
+                        if v is not None:
+                            settings.PropertyByAPIName("ForceConvergenceValue").InternalValue = v
+                        if t is not None:
+                            settings.PropertyByAPIName("ForceConvergenceTolerance").InternalValue = t
+                        if m is not None:
+                            settings.PropertyByAPIName("ForceConvergenceMinimumReference").InternalValue = m
+                        print("Step " + str(step_num) + " ForceConvergence set.")
+                        fc_changed += 1
+        if oc_changed > 0:
+            try:
+                model.Analyses[0].AnalysisSettings.Activate()
+            except:
+                pass
+            summary.append("Output Controls: " + str(oc_changed) + " step(s) updated.")
+        if fc_changed > 0:
+            summary.append("Force Convergence: " + str(fc_changed) + " step(s) updated.")
+    except Exception as ex:
+        print("Per-step settings HATA: " + str(ex))
+        summary.append("Per-step settings: ERROR - " + str(ex))
+    return summary
+
+
+def apply_output_controls(output_controls):
+    option_map   = {1: 1, 2: 0, 3: 2, 4: 3}
+    option_names = {1: "Last Time Point", 2: "All Time Points", 3: "Equally Spaced Points", 4: "Specified Recurrence Rate"}
+    summary = []
+    changed = 0
+    print("output_controls from form: " + str(output_controls))
+    try:
+        model = ExtAPI.DataModel.Project.Model
+        for analysis in model.Analyses:
+            settings = analysis.AnalysisSettings
+            for step_idx, sel in enumerate(output_controls):
+                if sel == 0:
+                    continue
+                step_num = step_idx + 1
+                val = option_map[sel]
+                # Her step icin ayri transaction
+                with Transaction(True):
+                    settings.CurrentStepNumber = step_num
+                    settings.PropertyByAPIName("StoreResultsAt").InternalValue = val
+                print("Step " + str(step_num) + " -> " + option_names[sel] + " (val=" + str(val) + ")")
+                changed += 1
+        if changed > 0:
+            try:
+                ExtAPI.DataModel.Project.Model.Analyses[0].AnalysisSettings.Activate()
+            except:
+                pass
+            summary.append("Output Controls: " + str(changed) + " step(s) updated.")
+    except Exception as ex:
+        print("Output Controls HATA: " + str(ex))
+        summary.append("Output Controls: ERROR - " + str(ex))
+    return summary
+
+
+def apply_contact_settings(contacts, progress=None):
+    summary = []
+    changed = 0
+    skipped = 0
+    total = len(contacts)
+    # Tum degisiklikleri tek Transaction icinde yap - cok daha hizli
+    with Transaction(True):
+        for i, contact in enumerate(contacts):
+            if progress is not None and progress.cancelled:
+                break
+            if progress is not None:
+                progress.update(
+                    "Applying Contact Settings...",
+                    str(i + 1) + " / " + str(total)
+                )
+            try:
+                if contact.ContactType == ContactType.Frictional:
+                    contact.Behavior = ContactBehavior.Asymmetric
+                    contact.ContactFormulation = ContactFormulation.PurePenalty
+                    contact.NormalStiffnessValueType = ElementControlsNormalStiffnessType.Factor
+                    contact.UpdateStiffness = UpdateContactStiffness.EachIteration
+                    contact.PropertyByAPIName("PenetrationTolerance").InternalValue = 1
+                    contact.PropertyByAPIName("PenetrationToleranceValue").InternalValue = 0.003
+                    print("OK (Frictional): " + contact.Name)
+                    changed += 1
+                elif contact.ContactType == ContactType.Bonded:
+                    contact.Behavior = ContactBehavior.Asymmetric
+                    contact.ContactFormulation = ContactFormulation.PurePenalty
+                    print("OK (Bonded): " + contact.Name)
+                    changed += 1
+                else:
+                    print("SKIPPED (not Frictional/Bonded): " + contact.Name)
+                    skipped += 1
+            except Exception as ex:
+                print("ERROR: " + contact.Name + " -> " + str(ex))
+                skipped += 1
+    summary.append("Contact Settings: " + str(changed) + " updated, " + str(skipped) + " skipped.")
+    return summary
+
+
+# ============================================================
+# PROGRESS FORM
+# ============================================================
+class ProgressForm(Form):
+
+    def __init__(self):
+        Form.__init__(self)
+        self.cancelled = False
+
+        self.Text = "Processing..."
+        self.Size = Size(380, 160)
+        self.FormBorderStyle = FormBorderStyle.FixedSingle
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = True
+        self.BackColor = Color.WhiteSmoke
+        self.TopMost = True
+
+        self.lbl_status = Label()
+        self.lbl_status.Text = "Starting..."
+        self.lbl_status.Font = Font("Segoe UI", 9, FontStyle.Regular)
+        self.lbl_status.Location = Point(15, 20)
+        self.lbl_status.Size = Size(340, 22)
+        self.Controls.Add(self.lbl_status)
+
+        self.lbl_detail = Label()
+        self.lbl_detail.Text = ""
+        self.lbl_detail.Font = Font("Segoe UI", 8, FontStyle.Italic)
+        self.lbl_detail.ForeColor = Color.DimGray
+        self.lbl_detail.Location = Point(15, 46)
+        self.lbl_detail.Size = Size(340, 18)
+        self.Controls.Add(self.lbl_detail)
+
+        btn_cancel = Button()
+        btn_cancel.Text = "Cancel"
+        btn_cancel.Font = Font("Segoe UI", 10, FontStyle.Regular)
+        btn_cancel.Location = Point(130, 80)
+        btn_cancel.Size = Size(100, 34)
+        btn_cancel.BackColor = Color.IndianRed
+        btn_cancel.ForeColor = Color.White
+        btn_cancel.Click += self.on_cancel
+        self.Controls.Add(btn_cancel)
+
+        self.FormClosing += self.on_closing
+
+    def update(self, status, detail=""):
+        self.lbl_status.Text = status
+        self.lbl_detail.Text = detail
+        Application.DoEvents()
+
+    def on_cancel(self, sender, event):
+        self.cancelled = True
+        self.lbl_status.Text = "Cancelling..."
+        self.lbl_detail.Text = ""
+
+    def on_closing(self, sender, event):
+        # X ile kapatmaya izin verme, sadece cancel butonuyla
+        if not self.cancelled:
+            event.Cancel = True
+
+
+# ============================================================
+# ANA AKIS
+# ============================================================
+form = MainForm()
+result = form.ShowDialog()
+
+if result == DialogResult.OK:
+    import System
+    start_time = System.DateTime.Now
+
+    progress = ProgressForm()
+    progress.Show()
+
+    all_summary = []
+    cancelled = False
+
+    # Large Deflection
+    progress.update("Applying Large Deflection...")
+    if not progress.cancelled:
+        all_summary += apply_large_deflection(form.large_deflection_on, form.selected_analyses)
+
+    # Per-step settings
+    if not progress.cancelled and (form.output_controls or form.force_convergence):
+        option_map   = {1: 1, 2: 0, 3: 2, 4: 3}
+        option_names = {1: "Last Time Point", 2: "All Time Points", 3: "Equally Spaced Points", 4: "Specified Recurrence Rate"}
+        oc_changed = 0
+        fc_changed = 0
+        num_steps = max(
+            len(form.output_controls) if form.output_controls else 0,
+            len(form.force_convergence) if form.force_convergence else 0
+        )
+        try:
+            for analysis in form.selected_analyses:
+                if progress.cancelled:
+                    break
+                settings = analysis.AnalysisSettings
+                for step_idx in range(num_steps):
+                    if progress.cancelled:
+                        break
+                    oc_sel = form.output_controls[step_idx]  if form.output_controls  and step_idx < len(form.output_controls)  else 0
+                    fc_row = form.force_convergence[step_idx] if form.force_convergence and step_idx < len(form.force_convergence) else None
+                    has_oc = (oc_sel != 0)
+                    has_fc = (fc_row is not None)
+                    if not has_oc and not has_fc:
+                        continue
+                    step_num = step_idx + 1
+                    progress.update(
+                        "Processing step " + str(step_num) + " / " + str(num_steps) + "...",
+                        ("Output Controls" if has_oc else "") + ("  +  Force Convergence" if has_fc else "")
+                    )
+                    with Transaction(True):
+                        settings.CurrentStepNumber = step_num
+                        if has_oc:
+                            val = option_map[oc_sel]
+                            settings.PropertyByAPIName("StoreResultsAt").InternalValue = val
+                            oc_changed += 1
+                        if has_fc:
+                            v, t, m = fc_row
+                            settings.PropertyByAPIName("ForceConvergence").InternalValue = 1
+                            if v is not None: settings.PropertyByAPIName("ForceConvergenceValue").InternalValue = v
+                            if t is not None: settings.PropertyByAPIName("ForceConvergenceTolerance").InternalValue = t
+                            if m is not None: settings.PropertyByAPIName("ForceConvergenceMinimumReference").InternalValue = m
+                            fc_changed += 1
+            if oc_changed > 0:
+                try: form.selected_analyses[0].AnalysisSettings.Activate()
+                except: pass
+                all_summary.append("Output Controls: " + str(oc_changed) + " step(s) updated.")
+            if fc_changed > 0:
+                all_summary.append("Force Convergence: " + str(fc_changed) + " step(s) updated.")
+        except Exception as ex:
+            all_summary.append("Per-step settings: ERROR - " + str(ex))
+
+    # Contact Settings
+    if not progress.cancelled and form.selected_contacts:
+        all_summary += apply_contact_settings(form.selected_contacts, progress)
+
+    # Substep Settings
+    if not progress.cancelled and form.substep_settings:
+        progress.update("Applying Substep Settings...")
+        all_summary += apply_substep_settings(form.substep_settings, form.selected_analyses)
+
+    # Bitti - progress form'u kapat
+    progress.cancelled = True
+    progress.Close()
+
+    # Gecen sure hesapla
+    elapsed = System.DateTime.Now - start_time
+    total_sec = int(elapsed.TotalSeconds)
+    mins = total_sec // 60
+    secs = total_sec % 60
+    if mins > 0:
+        time_str = str(mins) + " min " + str(secs) + " sec"
+    else:
+        time_str = str(total_sec) + " sec"
+
+    if all_summary:
+        msg = "Done!\n\n" + "\n".join(all_summary) + "\n\nDuration: " + time_str
+        if any("cancel" in s.lower() for s in all_summary) or cancelled:
+            msg = "Cancelled.\n\n" + "\n".join(all_summary) + "\n\nDuration: " + time_str
+        from System.Windows.Forms import MessageBox as MBox
+        MBox.Show(msg, "Result")
