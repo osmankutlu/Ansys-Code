@@ -1,0 +1,332 @@
+# NR Residual Command Generator
+# Ansys Mechanical - IronPython Script (Tools > Run Script)
+# Newton-Raphson artik (residual) kaydetme komutlarini otomatik olusturur.
+# NLDIAG,NRRE,ON,N --> belirtilen adimda aktif eder (N = kaydedilecek residual sayisi)
+# NLDIAG,NRRE,OFF  --> belirtilen adimda deaktif eder (None secilirse olusturulmaz)
+# Aktivasyon adimi 1'den farkliysa, 1. adimda otomatik olarak OFF komutu eklenir.
+
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (
+    Form, Label, ComboBox, Button,
+    DialogResult, FormStartPosition, FormBorderStyle,
+    MessageBox, MessageBoxButtons, MessageBoxIcon, ComboBoxStyle
+)
+from System.Drawing import Point, Size, Color
+
+from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
+
+
+def _no_scroll_cmb(cmb):
+    """Mouse wheel ComboBox secimini degistirmesin diye event'i bloklar."""
+    def _block(s, e):
+        try:
+            e.Handled = True
+        except:
+            pass
+    cmb.MouseWheel += _block
+    return cmb
+
+
+def build_form(title, fields):
+    """
+    Form olusturucu - tum IronPython versiyonlariyla uyumlu.
+    fields : label/choices/default_index iceren sozluk listesi
+    """
+    frm = Form()
+    frm.Text = title
+    frm.StartPosition = FormStartPosition.CenterScreen
+    frm.FormBorderStyle = FormBorderStyle.FixedDialog
+    frm.MaximizeBox = False
+    frm.MinimizeBox = False
+    frm.BackColor = Color.White
+
+    controls = {}
+    y = 15
+
+    for f in fields:
+        # Label olustur
+        lbl = Label()
+        lbl.Text = f["label"]
+        lbl.Location = Point(15, y + 3)
+        lbl.Size = Size(230, 20)
+        frm.Controls.Add(lbl)
+
+        # ComboBox olustur (acilir liste)
+        ctrl = ComboBox()
+        ctrl.DropDownStyle = ComboBoxStyle.DropDownList
+        for c in f["choices"]:
+            ctrl.Items.Add(c)
+        ctrl.SelectedIndex = f.get("default_index", -1)
+        ctrl.Location = Point(250, y)
+        ctrl.Size = Size(225, 22)
+        ctrl.BackColor = Color.White
+        _no_scroll_cmb(ctrl)   # mouse wheel ile secim degismesin
+        frm.Controls.Add(ctrl)
+        controls[f["label"]] = ctrl
+        y += 48
+
+    # --- OK ve Cancel butonlari ---
+    btn_ok = Button()
+    btn_ok.Text = "OK"
+    btn_ok.Size = Size(80, 28)
+    btn_ok.Location = Point(290, y + 5)
+    btn_ok.DialogResult = DialogResult.OK
+    frm.Controls.Add(btn_ok)
+    frm.AcceptButton = btn_ok
+
+    btn_cancel = Button()
+    btn_cancel.Text = "Cancel"
+    btn_cancel.Size = Size(80, 28)
+    btn_cancel.Location = Point(385, y + 5)
+    btn_cancel.DialogResult = DialogResult.Cancel
+    frm.Controls.Add(btn_cancel)
+    frm.CancelButton = btn_cancel
+
+    frm.ClientSize = Size(490, y + 50)
+
+    return frm, controls
+
+
+def get_form_vals(controls):
+    """Form kontrollerinden degerleri toplar."""
+    out = {}
+    for lbl, ctrl in controls.items():
+        out[lbl] = ctrl.SelectedItem
+    return out
+
+
+def run():
+    model = ExtAPI.DataModel.Project.Model
+
+    # --- Mevcut analizleri topla ---
+    analyses_list = []
+    for a in model.Analyses:
+        analyses_list.append(a)
+
+    if not analyses_list:
+        MessageBox.Show(
+            "No analysis found in the project!\nPlease set up an analysis first.",
+            "Error", MessageBoxButtons.OK, MessageBoxIcon.Error
+        )
+        return
+
+    # Analiz isimlerini listele: "1: StaticStructural" gibi
+    analysis_choices = []
+    for idx, a in enumerate(analyses_list):
+        try:
+            aname = str(a.Name)
+        except:
+            aname = "Analysis_" + str(idx + 1)
+        analysis_choices.append("{}: {}".format(idx + 1, aname))
+
+    # --- Ilk analizin adim sayisini varsayilan olarak al ---
+    try:
+        default_num_steps = analyses_list[0].AnalysisSettings.NumberOfSteps
+    except:
+        default_num_steps = 20
+
+    step_choices = [str(s) for s in range(1, default_num_steps + 1)]
+
+    # Deactivation icin None secenegi basta gelecek sekilde liste olustur
+    step_choices_with_none = ["None"] + step_choices
+
+    # Kaydedilecek residual sayisi secenekleri (1 - 10)
+    count_choices = [str(n) for n in range(1, 11)]
+
+    # --- Popup formu olustur ---
+    F_ANALYSIS = "Analysis"
+    F_ACT      = "Newton Raphson Activation Step"
+    F_COUNT    = "Newton Raphson Residual"
+    F_DEACT    = "Newton Raphson Deactivation Step"
+
+    frm, controls = build_form(
+        "Newton-Raphson Residual Command Generator",
+        [
+            {
+                "label":         F_ANALYSIS,
+                "choices":       analysis_choices,
+                "default_index": 0
+            },
+            {
+                "label":         F_ACT,
+                "choices":       step_choices,
+                "default_index": 0          # varsayilan: adim 1
+            },
+            {
+                "label":         F_COUNT,
+                "choices":       count_choices,
+                "default_index": 0          # varsayilan: 1
+            },
+            {
+                "label":         F_DEACT,
+                "choices":       step_choices_with_none,
+                "default_index": 0          # varsayilan: None
+            },
+        ]
+    )
+
+    # --- Kullanici iptal ederse cik ---
+    if frm.ShowDialog() != DialogResult.OK:
+        return
+
+    uv = get_form_vals(controls)
+
+    # --- Zorunlu alan dogrulamasi (Deactivation zorunlu degil) ---
+    for key in [F_ANALYSIS, F_ACT, F_COUNT]:
+        if not uv.get(key):
+            MessageBox.Show("Please select: " + key, "Error",
+                            MessageBoxButtons.OK, MessageBoxIcon.Error)
+            return
+
+    # --- Secilen analizi bul ---
+    selected_analysis_str = uv[F_ANALYSIS]
+    try:
+        sel_idx           = int(selected_analysis_str.split(":")[0]) - 1
+        selected_analysis = analyses_list[sel_idx]
+    except:
+        selected_analysis = analyses_list[0]
+
+    # Secilen analize gore adim sayisini guncelle
+    try:
+        num_steps = selected_analysis.AnalysisSettings.NumberOfSteps
+    except:
+        num_steps = default_num_steps
+
+    # --- Activation adim numarasini oku ---
+    try:
+        step_on = int(uv[F_ACT])
+    except:
+        MessageBox.Show("Invalid activation step number!", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return
+
+    # --- Residual sayisini oku ---
+    try:
+        nr_count = int(uv[F_COUNT])
+    except:
+        MessageBox.Show("Invalid number of NR residuals!", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return
+
+    # --- Deactivation adim numarasini oku (None ise None kalir) ---
+    deact_val = uv[F_DEACT]
+    if deact_val == "None" or deact_val is None:
+        step_off = None
+    else:
+        try:
+            step_off = int(deact_val)
+        except:
+            MessageBox.Show("Invalid deactivation step number!", "Error",
+                            MessageBoxButtons.OK, MessageBoxIcon.Error)
+            return
+
+    # Adim siniri kontrolu
+    if step_on > num_steps:
+        MessageBox.Show(
+            "Activation step exceeds the number of steps in the analysis ({})!\n"
+            "Please check your step selection.".format(num_steps),
+            "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+        )
+        return
+
+    if step_off is not None and step_off > num_steps:
+        MessageBox.Show(
+            "Deactivation step exceeds the number of steps in the analysis ({})!\n"
+            "Please check your step selection.".format(num_steps),
+            "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+        )
+        return
+
+    # Deactivation, activation'dan sonra olmali
+    if step_off is not None and step_off <= step_on:
+        MessageBox.Show(
+            "Deactivation step must be greater than the activation step!",
+            "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning
+        )
+        return
+
+    # --- Komut metinleri ---
+    # ON komutuna residual sayisi eklenir (OFF'a eklenmez)
+    nldiag_on_text  = "NLDIAG,NRRE,ON,{}".format(nr_count)
+    nldiag_off_text = "NLDIAG,NRRE,OFF"
+
+    # --- Command Snippet'leri analize ekle ---
+    cmd_init_off_added = False
+    cmd_on_added       = False
+    cmd_off_added      = False
+
+    # Aktivasyon 1. adimdan farkliysa 1. adima OFF komutu eklenecek
+    need_initial_off = (step_on != 1)
+
+    try:
+        def make_snippet(name, text, step):
+            """Belirtilen isim, metin ve adim numarasiyla command snippet olusturur."""
+            cmd = selected_analysis.AddCommandSnippet()
+            cmd.Name = name
+            # Farkli Ansys versiyonlarinda farkli property isimleri olabilir
+            for attr in ["Input", "CommandText", "Commands", "Text"]:
+                try:
+                    setattr(cmd, attr, text)
+                    break
+                except:
+                    pass
+            cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+            cmd.StepNumber        = step
+            return cmd
+
+        # 1. adimda baslangic OFF snippet'i (yalnizca aktivasyon adimi 1 degilse)
+        if need_initial_off:
+            make_snippet(
+                "Newton Raphson Off - Step 1",
+                nldiag_off_text,
+                1
+            )
+            cmd_init_off_added = True
+
+        # ON snippet'i olustur (her zaman olusturulur)
+        make_snippet(
+            "Newton Raphson On - Step {}".format(step_on),
+            nldiag_on_text,
+            step_on
+        )
+        cmd_on_added = True
+
+        # Deactivation OFF snippet'i yalnizca None degilse olustur
+        if step_off is not None:
+            make_snippet(
+                "Newton Raphson Off - Step {}".format(step_off),
+                nldiag_off_text,
+                step_off
+            )
+            cmd_off_added = True
+
+    except Exception as e:
+        MessageBox.Show(
+            "Could not add command snippet(s):\n" + str(e),
+            "Error", MessageBoxButtons.OK, MessageBoxIcon.Error
+        )
+        return
+
+    # --- Sonuc mesaji ---
+    msg  = "Newton-Raphson Residual commands added successfully!\n\n"
+    msg += "Analysis : {}\n\n".format(selected_analysis_str)
+    if need_initial_off:
+        msg += "NLDIAG,NRRE,OFF --> Step 1 (initial): {}\n".format(
+            "Added" if cmd_init_off_added else "FAILED")
+    msg += "NLDIAG,NRRE,ON,{} --> Step {}: {}\n".format(
+        nr_count, step_on, "Added" if cmd_on_added else "FAILED")
+    if step_off is not None:
+        msg += "NLDIAG,NRRE,OFF --> Step {}: {}\n".format(
+            step_off, "Added" if cmd_off_added else "FAILED")
+    else:
+        msg += "NLDIAG,NRRE,OFF --> Not created (None selected)\n"
+    msg += "\nCommand snippets are visible in the Outline tree\n"
+    msg += "under the selected analysis."
+
+    MessageBox.Show(msg, "Done", MessageBoxButtons.OK, MessageBoxIcon.Information)
+
+
+run()
