@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+import clr
+clr.AddReference("System")
+clr.AddReference("mscorlib")
+from System import Array, Byte, Convert
+from System.IO import MemoryStream
+from System.Text import Encoding
+from System.Security.Cryptography import (Aes, Rfc2898DeriveBytes, HMACSHA256,
+                                          RNGCryptoServiceProvider)
+
+_PARTS = ["Ch4ng3", "-M3-", "0sm4n", "-2026"]
+_SECRET = "".join(_PARTS)[::-1]
+_MAGIC = Encoding.ASCII.GetBytes("ACP1")
+
+
+def _cat(*parts):
+    ms = MemoryStream()
+    for p in parts:
+        ms.Write(p, 0, p.Length)
+    return ms.ToArray()
+
+
+def _slice(b, off, n):
+    out = Array.CreateInstance(Byte, n)
+    Array.Copy(b, off, out, 0, n)
+    return out
+
+
+def _rand(n):
+    out = Array.CreateInstance(Byte, n)
+    RNGCryptoServiceProvider().GetBytes(out)
+    return out
+
+
+def _derive(salt):
+    d = Rfc2898DeriveBytes(_SECRET, salt, 20000)
+    return d.GetBytes(32), d.GetBytes(32)
+
+
+def pack(name, desc, code):
+    salt, iv = _rand(16), _rand(16)
+    ek, mk = _derive(salt)
+    aes = Aes.Create()
+    aes.Key = ek
+    aes.IV = iv
+    plain = Encoding.UTF8.GetBytes(name.replace("\n", " ") + "\n" +
+                                   desc.replace("\n", " ") + "\n" + code)
+    ct = aes.CreateEncryptor().TransformFinalBlock(plain, 0, plain.Length)
+    mac = HMACSHA256(mk).ComputeHash(_cat(iv, ct))
+    return _cat(_MAGIC, salt, iv, mac, ct)
+
+
+def unpack(data):
+    if data.Length < 4 + 16 + 16 + 32 + 16 or \
+            Convert.ToBase64String(_slice(data, 0, 4)) != Convert.ToBase64String(_MAGIC):
+        raise Exception("Invalid package file.")
+    salt = _slice(data, 4, 16)
+    iv = _slice(data, 20, 16)
+    mac = _slice(data, 36, 32)
+    ct = _slice(data, 68, data.Length - 68)
+    ek, mk = _derive(salt)
+    calc = HMACSHA256(mk).ComputeHash(_cat(iv, ct))
+    if Convert.ToBase64String(calc) != Convert.ToBase64String(mac):
+        raise Exception("Package is corrupted or has been modified.")
+    aes = Aes.Create()
+    aes.Key = ek
+    aes.IV = iv
+    plain = aes.CreateDecryptor().TransformFinalBlock(ct, 0, ct.Length)
+    text = Encoding.UTF8.GetString(plain)
+    parts = text.split("\n", 2)
+    return parts[0], parts[1], parts[2]
+
+
+# ======== PACKER UI ========
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+from System.Windows.Forms import (Form, Label, TextBox, Button, OpenFileDialog,
+                                  SaveFileDialog, DialogResult, MessageBox,
+                                  FormStartPosition, FormBorderStyle, FlatStyle)
+from System.Drawing import Point, Size, Color
+from System.IO import File, Path
+
+
+class PackerForm(Form):
+    def __init__(self):
+        self.Text = "ACP Packer"
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.ClientSize = Size(520, 190)
+
+        self.src = TextBox()
+        self.src.Location = Point(15, 30)
+        self.src.Size = Size(380, 22)
+        self.dst = TextBox()
+        self.dst.Location = Point(15, 85)
+        self.dst.Size = Size(380, 22)
+
+        b1 = Button()
+        b1.Text = "Browse..."
+        b1.Location = Point(405, 28)
+        b1.Click += self.browse_src
+        b2 = Button()
+        b2.Text = "Browse..."
+        b2.Location = Point(405, 83)
+        b2.Click += self.browse_dst
+
+        w = 140
+        self.pack_btn = Button()
+        self.pack_btn.Text = "Pack (.acp)"
+        self.pack_btn.Size = Size(w, 34)
+        self.pack_btn.Location = Point((self.ClientSize.Width - w) // 2, 135)
+        self.pack_btn.FlatStyle = FlatStyle.Flat
+        self.pack_btn.FlatAppearance.BorderSize = 0
+        self.pack_btn.BackColor = Color.FromArgb(0, 120, 215)
+        self.pack_btn.ForeColor = Color.White
+        self.pack_btn.Click += self.build
+
+        for text, x, y in (("Source file (.py or .txt)", 15, 10),
+                           ("Save location (.acp)", 15, 65)):
+            l = Label()
+            l.Text = text
+            l.Location = Point(x, y)
+            l.AutoSize = True
+            self.Controls.Add(l)
+        for c in (self.src, self.dst, b1, b2, self.pack_btn):
+            self.Controls.Add(c)
+
+    def browse_src(self, s, e):
+        d = OpenFileDialog()
+        d.Title = "Select source file"
+        d.Filter = "Python or text files (*.py;*.txt)|*.py;*.txt|All files (*.*)|*.*"
+        if d.ShowDialog() == DialogResult.OK:
+            self.src.Text = d.FileName
+            # default save location: same folder, same name, .acp extension
+            self.dst.Text = Path.Combine(Path.GetDirectoryName(d.FileName),
+                                         Path.GetFileNameWithoutExtension(d.FileName) + ".acp")
+
+    def browse_dst(self, s, e):
+        d = SaveFileDialog()
+        d.Title = "Select save location"
+        d.Filter = "ACP package (*.acp)|*.acp"
+        if self.src.Text.strip():
+            d.FileName = Path.GetFileNameWithoutExtension(self.src.Text) + ".acp"
+        if d.ShowDialog() == DialogResult.OK:
+            self.dst.Text = d.FileName
+
+    def build(self, s, e):
+        try:
+            if not self.src.Text.strip():
+                MessageBox.Show("Please select a source file.")
+                return
+            if not self.dst.Text.strip():
+                MessageBox.Show("Please select a save location.")
+                return
+            name = Path.GetFileNameWithoutExtension(self.src.Text)
+            code = File.ReadAllText(self.src.Text, Encoding.UTF8)
+            code = code.replace("\r\n", "\n")
+            compile(code, self.src.Text, "exec")        # syntax check
+            out = self.dst.Text.strip()
+            if not out.lower().endswith(".acp"):
+                out = out + ".acp"
+            File.WriteAllBytes(out, pack(name, "", code))
+            MessageBox.Show("Package created:\n" + out)
+        except Exception as ex:
+            MessageBox.Show("Error: " + str(ex))
+
+
+PackerForm().ShowDialog()

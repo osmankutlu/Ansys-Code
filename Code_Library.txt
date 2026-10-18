@@ -1,0 +1,439 @@
+# -*- coding: utf-8 -*-
+import clr
+clr.AddReference("System")
+clr.AddReference("mscorlib")
+from System import Array, Byte, Convert
+from System.IO import MemoryStream
+from System.Text import Encoding
+from System.Security.Cryptography import (Aes, Rfc2898DeriveBytes, HMACSHA256,
+                                          RNGCryptoServiceProvider)
+
+_PARTS = ["Ch4ng3", "-M3-", "0sm4n", "-2026"]
+_SECRET = "".join(_PARTS)[::-1]
+_MAGIC = Encoding.ASCII.GetBytes("ACP1")
+
+
+def _cat(*parts):
+    ms = MemoryStream()
+    for p in parts:
+        ms.Write(p, 0, p.Length)
+    return ms.ToArray()
+
+
+def _slice(b, off, n):
+    out = Array.CreateInstance(Byte, n)
+    Array.Copy(b, off, out, 0, n)
+    return out
+
+
+def _rand(n):
+    out = Array.CreateInstance(Byte, n)
+    RNGCryptoServiceProvider().GetBytes(out)
+    return out
+
+
+def _derive(salt):
+    d = Rfc2898DeriveBytes(_SECRET, salt, 20000)
+    return d.GetBytes(32), d.GetBytes(32)
+
+
+def pack(name, desc, code):
+    salt, iv = _rand(16), _rand(16)
+    ek, mk = _derive(salt)
+    aes = Aes.Create()
+    aes.Key = ek
+    aes.IV = iv
+    plain = Encoding.UTF8.GetBytes(name.replace("\n", " ") + "\n" +
+                                   desc.replace("\n", " ") + "\n" + code)
+    ct = aes.CreateEncryptor().TransformFinalBlock(plain, 0, plain.Length)
+    mac = HMACSHA256(mk).ComputeHash(_cat(iv, ct))
+    return _cat(_MAGIC, salt, iv, mac, ct)
+
+
+def unpack(data):
+    if data.Length < 4 + 16 + 16 + 32 + 16 or \
+            Convert.ToBase64String(_slice(data, 0, 4)) != Convert.ToBase64String(_MAGIC):
+        raise Exception("Invalid package file.")
+    salt = _slice(data, 4, 16)
+    iv = _slice(data, 20, 16)
+    mac = _slice(data, 36, 32)
+    ct = _slice(data, 68, data.Length - 68)
+    ek, mk = _derive(salt)
+    calc = HMACSHA256(mk).ComputeHash(_cat(iv, ct))
+    if Convert.ToBase64String(calc) != Convert.ToBase64String(mac):
+        raise Exception("Package is corrupted or has been modified.")
+    aes = Aes.Create()
+    aes.Key = ek
+    aes.IV = iv
+    plain = aes.CreateDecryptor().TransformFinalBlock(ct, 0, ct.Length)
+    text = Encoding.UTF8.GetString(plain)
+    parts = text.split("\n", 2)
+    return parts[0], parts[1], parts[2]
+
+
+# ======== CODE LIBRARY UI ========
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+from System import Environment
+from System.Windows.Forms import (Form, Label, TextBox, Button, Panel, Control, OpenFileDialog,
+                                  DialogResult, MessageBox, MessageBoxButtons, ToolTip,
+                                  MouseButtons, FormStartPosition, FormBorderStyle,
+                                  FlatStyle, Cursors, SystemInformation)
+from System.Drawing import (Size, Point, PointF, Color, ContentAlignment, Font, FontStyle,
+                            SolidBrush, Pen)
+from System.Drawing.Drawing2D import SmoothingMode
+from System.IO import File, Path, Directory
+
+LIB_DIR = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                       "AcpLibrary")
+if not Directory.Exists(LIB_DIR):
+    Directory.CreateDirectory(LIB_DIR)
+ORDER_FILE = Path.Combine(LIB_DIR, "order.txt")
+
+HOST = globals()    # ExtAPI, DataModel, Model, Tree... are passed on to the package code
+
+# Layout constants
+FORM_W = 370
+TOP_H = 64
+LIST_H = 396
+ROW_W = 340
+ROW_H = 40
+
+
+def style_button(b, bg, fg, border, hover, down):
+    """Gives a flat button a real 'clickable' look: border, hover and pressed colors."""
+    b.FlatStyle = FlatStyle.Flat
+    b.FlatAppearance.BorderSize = 1
+    b.FlatAppearance.BorderColor = border
+    b.FlatAppearance.MouseOverBackColor = hover
+    b.FlatAppearance.MouseDownBackColor = down
+    b.UseVisualStyleBackColor = False
+    b.BackColor = bg
+    b.ForeColor = fg
+    b.Cursor = Cursors.Hand
+
+
+def paint_pencil(s, e):
+    """Draws a pencil icon in the middle of the button."""
+    g = e.Graphics
+    g.SmoothingMode = SmoothingMode.AntiAlias
+    ox = (s.Width - 16) / 2.0
+    oy = (s.Height - 16) / 2.0
+    pts = [(2, 14), (4.5, 9.5), (9.5, 4.5), (11, 3), (13, 5), (11.5, 6.5), (6.5, 11.5)]
+    arr = Array[PointF]([PointF(ox + x, oy + y) for x, y in pts])
+    br = SolidBrush(Color.FromArgb(70, 70, 70))
+    g.FillPolygon(br, arr)
+    br.Dispose()
+
+
+def paint_trash(s, e):
+    """Draws a trash-can icon in the middle of the button."""
+    g = e.Graphics
+    g.SmoothingMode = SmoothingMode.AntiAlias
+    ox = (s.Width - 16) / 2.0
+    oy = (s.Height - 16) / 2.0
+    pen = Pen(Color.FromArgb(160, 40, 40), 1.4)
+    g.DrawLine(pen, ox + 2.5, oy + 4.0, ox + 13.5, oy + 4.0)          # lid
+    g.DrawLine(pen, ox + 6.0, oy + 4.0, ox + 6.0, oy + 2.0)           # handle
+    g.DrawLine(pen, ox + 6.0, oy + 2.0, ox + 10.0, oy + 2.0)
+    g.DrawLine(pen, ox + 10.0, oy + 2.0, ox + 10.0, oy + 4.0)
+    body = [(4, 5.5), (12, 5.5), (11, 14.5), (5, 14.5)]               # body
+    g.DrawPolygon(pen, Array[PointF]([PointF(ox + x, oy + y) for x, y in body]))
+    g.DrawLine(pen, ox + 6.7, oy + 7.5, ox + 6.9, oy + 12.5)          # ribs
+    g.DrawLine(pen, ox + 9.3, oy + 7.5, ox + 9.1, oy + 12.5)
+    pen.Dispose()
+
+
+def run_package(path):
+    try:
+        name, desc, code = unpack(File.ReadAllBytes(path))
+    except Exception as ex:
+        MessageBox.Show(str(ex), "Cannot open package")
+        return
+    ns = dict(HOST)
+    ns["__name__"] = "__main__"
+    try:
+        exec(compile(code, "<" + name + ">", "exec"), ns)
+    except Exception as ex:
+        MessageBox.Show(str(ex), name + " - runtime error")
+
+
+def ask_name(current):
+    """Small input dialog. Returns the new name, or None if cancelled."""
+    f = Form()
+    f.Text = "Rename"
+    f.StartPosition = FormStartPosition.CenterScreen
+    f.FormBorderStyle = FormBorderStyle.FixedDialog
+    f.MaximizeBox = False
+    f.MinimizeBox = False
+    f.ClientSize = Size(320, 110)
+    l = Label()
+    l.Text = "New name"
+    l.Location = Point(15, 10)
+    l.AutoSize = True
+    tb = TextBox()
+    tb.Text = current
+    tb.Location = Point(15, 32)
+    tb.Size = Size(290, 22)
+    ok = Button()
+    ok.Text = "OK"
+    ok.Location = Point(145, 70)
+    ok.DialogResult = DialogResult.OK
+    cancel = Button()
+    cancel.Text = "Cancel"
+    cancel.Location = Point(230, 70)
+    cancel.DialogResult = DialogResult.Cancel
+    f.AcceptButton = ok
+    f.CancelButton = cancel
+    for c in (l, tb, ok, cancel):
+        f.Controls.Add(c)
+    if f.ShowDialog() == DialogResult.OK:
+        return tb.Text.strip()
+    return None
+
+
+def load_order():
+    if File.Exists(ORDER_FILE):
+        return [l.strip() for l in File.ReadAllText(ORDER_FILE).split("\n") if l.strip()]
+    return []
+
+
+class LibraryForm(Form):
+    def __init__(self):
+        self.Text = "Code Library"
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.ClientSize = Size(FORM_W, TOP_H + LIST_H)
+        self.selected = None
+        self.tip = ToolTip()
+
+        # drag & drop state
+        self.items = []          # [(name, path)] in display order
+        self.rows = []           # [(num, run, pen, trash)] controls per row
+        self.drag_i = None
+        self.dragging = False
+        self.suppress_click = False
+        self.drag_y0 = 0
+        self.origin = 0
+        self.target = 0
+
+        # Blue "Load new package" button, centered at the top
+        top = Button()
+        top.Text = "Load new package (.acp)..."
+        top.Size = Size(240, 38)
+        top.Location = Point((FORM_W - 240) // 2, 13)
+        top.Font = Font(top.Font, FontStyle.Bold)
+        style_button(top, Color.FromArgb(0, 120, 215), Color.White,
+                     Color.FromArgb(0, 90, 158), Color.FromArgb(16, 110, 190),
+                     Color.FromArgb(0, 84, 153))
+        top.Click += self.load_new
+
+        # Scrollable list area
+        self.panel = Panel()
+        self.panel.Location = Point(0, TOP_H)
+        self.panel.Size = Size(FORM_W, LIST_H)
+        self.panel.AutoScroll = True
+
+        self.Controls.Add(self.panel)
+        self.Controls.Add(top)
+        self.refresh()
+
+    # ---------- list building ----------
+    def save_order(self):
+        names = [Path.GetFileName(p) for (n, p) in self.items]
+        File.WriteAllText(ORDER_FILE, "\n".join(names))
+
+    def refresh(self, keep_scroll=False):
+        scroll_y = abs(self.panel.AutoScrollPosition.Y) if keep_scroll else 0
+        self.panel.Controls.Clear()
+        self.rows = []
+        self.panel.AutoScrollPosition = Point(0, 0)
+
+        order = load_order()
+        found = []
+        for f in Directory.GetFiles(LIB_DIR, "*.acp"):
+            try:
+                name, desc, _ = unpack(File.ReadAllBytes(f))
+            except Exception:
+                continue
+            fn = Path.GetFileName(f)
+            idx = order.index(fn) if fn in order else 10 ** 6
+            found.append((idx, name.lower(), name, f))
+        found.sort()
+        self.items = [(name, f) for (idx, low, name, f) in found]
+
+        # Horizontal centering (leave room for the scroll bar when it will be visible)
+        need_scroll = len(self.items) * ROW_H + 10 > LIST_H
+        avail = FORM_W - (SystemInformation.VerticalScrollBarWidth if need_scroll else 0)
+        x0 = (avail - ROW_W) // 2
+
+        if not self.items:
+            l = Label()
+            l.Text = "No saved packages yet."
+            l.Size = Size(ROW_W, 30)
+            l.Location = Point(x0, 14)
+            l.TextAlign = ContentAlignment.MiddleCenter
+            self.panel.Controls.Add(l)
+            return
+
+        for i, (name, path) in enumerate(self.items):
+            y = 8 + i * ROW_H
+
+            num = Label()
+            num.Text = str(i + 1) + "."
+            num.Size = Size(28, 32)
+            num.Location = Point(x0, y)
+            num.TextAlign = ContentAlignment.MiddleRight
+
+            run = Button()
+            run.Text = name
+            run.Size = Size(236, 32)
+            run.Location = Point(x0 + 32, y)
+            run.TextAlign = ContentAlignment.MiddleCenter
+            style_button(run, Color.FromArgb(240, 240, 240), Color.Black,
+                         Color.FromArgb(173, 173, 173), Color.FromArgb(229, 241, 251),
+                         Color.FromArgb(204, 228, 247))
+            self.tip.SetToolTip(run, "Click: run   |   Drag up/down: change order")
+            click, down, move, up = self.make_run_handlers(i, path)
+            run.Click += click
+            run.MouseDown += down
+            run.MouseMove += move
+            run.MouseUp += up
+
+            pen = Button()
+            pen.Size = Size(32, 32)
+            pen.Location = Point(x0 + 272, y)
+            style_button(pen, Color.FromArgb(250, 250, 250), Color.Black,
+                         Color.FromArgb(200, 200, 200), Color.FromArgb(229, 241, 251),
+                         Color.FromArgb(204, 228, 247))
+            pen.Paint += paint_pencil
+            self.tip.SetToolTip(pen, "Rename")
+            pen.Click += self.make_rename(path)
+
+            trash = Button()
+            trash.Size = Size(32, 32)
+            trash.Location = Point(x0 + 308, y)
+            style_button(trash, Color.FromArgb(250, 250, 250), Color.Black,
+                         Color.FromArgb(200, 200, 200), Color.FromArgb(253, 231, 233),
+                         Color.FromArgb(250, 208, 212))
+            trash.Paint += paint_trash
+            self.tip.SetToolTip(trash, "Delete")
+            trash.Click += self.make_delete(path, name)
+
+            row = (num, run, pen, trash)
+            self.rows.append(row)
+            for c in row:
+                self.panel.Controls.Add(c)
+
+        if keep_scroll and scroll_y:
+            self.panel.PerformLayout()
+            self.panel.AutoScrollPosition = Point(0, scroll_y)
+
+    # ---------- run + drag & drop ----------
+    def make_run_handlers(self, i, path):
+        def click(s, e):
+            if self.suppress_click:           # this click was the end of a drag
+                self.suppress_click = False
+                return
+            self.selected = path
+            self.Close()
+
+        def down(s, e):
+            self.suppress_click = False
+            if e.Button == MouseButtons.Left:
+                self.drag_i = i
+                self.drag_y0 = Control.MousePosition.Y
+                self.dragging = False
+
+        def move(s, e):
+            if self.drag_i != i or e.Button != MouseButtons.Left:
+                return
+            dy = Control.MousePosition.Y - self.drag_y0
+            if not self.dragging:
+                if abs(dy) < 6:
+                    return
+                self.dragging = True
+                self.suppress_click = True
+                self.origin = self.rows[0][0].Top
+                for c in self.rows[i]:
+                    c.BringToFront()
+            self.update_drag(i, dy)
+
+        def up(s, e):
+            if self.drag_i == i and self.dragging:
+                item = self.items.pop(i)
+                self.items.insert(self.target, item)
+                self.save_order()
+                self.dragging = False
+                self.drag_i = None
+                self.refresh(True)
+            else:
+                self.drag_i = None
+
+        return click, down, move, up
+
+    def update_drag(self, i, dy):
+        n = len(self.rows)
+        top = self.origin + i * ROW_H + dy
+        top = max(self.origin - ROW_H // 2, min(top, self.origin + (n - 1) * ROW_H + ROW_H // 2))
+        t = int(round(float(top - self.origin) / ROW_H))
+        t = max(0, min(n - 1, t))
+        self.target = t
+        order = [k for k in range(n) if k != i]
+        order.insert(t, i)
+        for pos, k in enumerate(order):
+            ty = top if k == i else self.origin + pos * ROW_H
+            for c in self.rows[k]:
+                c.Top = ty
+
+    # ---------- other actions ----------
+    def make_delete(self, path, name):
+        def h(s, e):
+            r = MessageBox.Show("Delete '" + name + "' from the library?",
+                                "Delete", MessageBoxButtons.YesNo)
+            if r == DialogResult.Yes:
+                File.Delete(path)
+                self.refresh(True)
+        return h
+
+    def make_rename(self, path):
+        def h(s, e):
+            try:
+                name, desc, code = unpack(File.ReadAllBytes(path))
+            except Exception as ex:
+                MessageBox.Show(str(ex), "Cannot open package")
+                return
+            new = ask_name(name)
+            if new and new != name:
+                File.WriteAllBytes(path, pack(new, desc, code))
+                self.refresh(True)
+        return h
+
+    def load_new(self, s, e):
+        d = OpenFileDialog()
+        d.Title = "Select package"
+        d.Filter = "ACP package (*.acp)|*.acp"
+        if d.ShowDialog() != DialogResult.OK:
+            return
+        try:
+            unpack(File.ReadAllBytes(d.FileName))     # is it a valid package?
+        except Exception as ex:
+            MessageBox.Show(str(ex), "Cannot open package")
+            return
+        target = d.FileName
+        r = MessageBox.Show("Save this package to the library as a button?",
+                            "Save to library", MessageBoxButtons.YesNo)
+        if r == DialogResult.Yes:
+            target = Path.Combine(LIB_DIR, Path.GetFileName(d.FileName))
+            File.Copy(d.FileName, target, True)
+        self.selected = target
+        self.Close()
+
+
+# The window closes first, then the chosen package runs while Mechanical is free
+form = LibraryForm()
+form.ShowDialog()
+if form.selected:
+    run_package(form.selected)
