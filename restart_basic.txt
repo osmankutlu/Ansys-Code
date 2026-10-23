@@ -1,0 +1,134 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Ansys Mechanical - TEMEL RESTART TESTI (log yok, sonuc tek mesaj kutusunda)
+#
+#  1) Restart ayarlarini yapar (eski degerleri saklar)
+#  2) Step 1..STOP_AFTER'i cozer, STOP_AFTER+1'in basinda /EOF ile durdurur
+#  3) RESTART_AT. step'in sonundan restart ederek tekrar cozer
+#  4) Sureleri ve "solver hangi load step'ten restart etti" bilgisini gosterir
+#  5) Gecici snippet'leri siler, restart ayarlarini eski haline getirir
+#
+# step sayisina (NumberOfSteps) dokunmaz.
+# =============================================================================
+import clr
+import os
+import re
+import time
+import System
+clr.AddReference("System.Windows.Forms")
+from System.Windows.Forms import MessageBox
+from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
+
+STOP_AFTER = 4     # ilk cozum bu step'e kadar
+RESTART_AT = 3     # bu step'in sonundan restart (STOP_AFTER'dan kucuk olmali)
+
+PROPS = ["GenerateRestartPoints", "SaveAtLoadStep", "SaveAtSubstep", "RetainFilesAfterFullSolve",
+         "CombineRestartFiles", "DeleteUnneededFiles", "RestartType", "CurrentRestartPoint"]
+
+an = None
+for a in ExtAPI.DataModel.Project.Model.Analyses:
+    if "static" in str(a.AnalysisType).lower():
+        an = a
+        break
+
+def set_enum(st, prop, name):
+    cur = getattr(st, prop)
+    if str(cur).replace(" ", "").lower() == name.lower():
+        return
+    setattr(st, prop, System.Enum.Parse(cur.GetType(), name))
+
+def solve(an):
+    t0 = time.time()
+    an.Solve(True)
+    return time.time() - t0
+
+def restart_from(wd):
+    """solve.out'tan: solver hangi load step'ten restart etti? (restart yoksa None)"""
+    found = None
+    f = open(os.path.join(wd, "solve.out"), "r")
+    for line in f:
+        m = re.search(r"RESTART PREVIOUSLY RUN ANALYSIS FROM LOADSTEP\s+(\d+)", line)
+        if m:
+            found = int(m.group(1))
+    f.close()
+    return found
+
+def point_at(st, step):
+    """Verilen load step'in sonundaki restart noktasinin numarasini bulur."""
+    set_enum(st, "RestartType", "Manual")
+    for i in range(30):
+        st.CurrentRestartPoint = i
+        if int(st.RestartAtLoadStep) == step:
+            return i
+    return None
+
+def add_snippet(an, name, text, step):
+    c = an.AddCommandSnippet()
+    c.Name = name
+    c.Input = text
+    c.StepSelectionMode = SequenceSelectionType.ByNumber
+    c.StepNumber = step
+    return c
+
+if an is None:
+    MessageBox.Show("Static Structural analysis not found.")
+else:
+    st = an.AnalysisSettings
+    wd = unicode(an.WorkingDir)
+    saved = {}
+    for p in PROPS:
+        try:
+            saved[p] = getattr(st, p)
+        except:
+            pass
+    temp = []
+    msg = ""
+    try:
+        # 1) restart ayarlari
+        set_enum(st, "GenerateRestartPoints", "Manual")
+        set_enum(st, "SaveAtLoadStep", "All")
+        set_enum(st, "SaveAtSubstep", "Last")
+        set_enum(st, "RetainFilesAfterFullSolve", "Yes")
+        set_enum(st, "CombineRestartFiles", "Yes")
+        try:
+            st.DeleteUnneededFiles = False
+        except:
+            pass
+
+        # 2) ilk cozum: sifirdan, STOP_AFTER'dan sonra dur
+        temp.append(add_snippet(an, "RESTART_BASIC_STOP", "/EOF", STOP_AFTER + 1))
+        set_enum(st, "RestartType", "Manual")
+        st.CurrentRestartPoint = 0
+        t1 = solve(an)
+
+        # 3) RESTART_AT. step'in sonundan restart: zararsiz bir degisiklik yap ve coz
+        idx = point_at(st, RESTART_AT)
+        if idx is None:
+            msg = "Restart point at the end of step %d was not found." % RESTART_AT
+        else:
+            temp.append(add_snippet(an, "RESTART_BASIC_MARK", "/COM, restart test", RESTART_AT + 1))
+            st.CurrentRestartPoint = idx
+            t2 = solve(an)
+            rf = restart_from(wd)
+            msg = ("First solve (steps 1..%d, from scratch): %.0f s\n"
+                   "Restart solve (from end of step %d):     %.0f s\n"
+                   "Solver restarted from load step: %s\n\n%s") % (
+                       STOP_AFTER, t1, RESTART_AT, t2, str(rf),
+                       "RESTART WORKED" if rf == RESTART_AT else "RESTART DID NOT HAPPEN (solved from scratch)")
+    except Exception as ex:
+        msg = "Error: " + str(ex)
+    finally:
+        # 5) temizlik + ayarlari eski haline getir
+        for c in temp:
+            try:
+                c.Delete()
+            except:
+                pass
+        for p in ["RestartType", "CurrentRestartPoint", "GenerateRestartPoints", "SaveAtLoadStep",
+                  "SaveAtSubstep", "RetainFilesAfterFullSolve", "CombineRestartFiles", "DeleteUnneededFiles"]:
+            if p in saved:
+                try:
+                    setattr(st, p, saved[p])
+                except:
+                    pass
+    MessageBox.Show(msg + "\n\n(restart settings restored)", "Restart basic test")
