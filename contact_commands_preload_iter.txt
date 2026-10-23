@@ -13,12 +13,67 @@ from System.Windows.Forms import (Form, Button, Label,
 from System.Drawing import Size, Point, Font, FontStyle, Color, ContentAlignment
 from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
 from System import DateTime
+import System
+import System.IO
+import time
 import re
+import os
+import math
 
 try:
     from Ansys.Mechanical.DataModel.Enums import LocationDefinitionMethod
 except:
     LocationDefinitionMethod = None
+
+# ---------------------------------------------------------------
+# Tema renkleri (tek yerden degistirilebilir)
+# ---------------------------------------------------------------
+THEME_BLUE      = Color.FromArgb(0, 120, 215)    # birincil buton
+THEME_BLUE_DARK = Color.FromArgb(0, 90, 180)     # grup basliklari / numara
+THEME_TITLE     = Color.FromArgb(0, 70, 150)     # yonerge basliklari
+THEME_STOP      = Color.FromArgb(200, 0, 0)      # Stop / sil butonu
+THEME_GREY      = Color.FromArgb(230, 230, 230)  # ikincil buton
+THEME_OK        = Color.FromArgb(40, 130, 90)    # basarili deneme
+THEME_ROW_A     = Color.White
+THEME_ROW_B     = Color.FromArgb(240, 245, 252)
+
+PRIMARY_TEXTS = [u"Start", u"Next >", u"Apply", u"Friction", u"Preload", u"Manual", u"Iteration"]
+
+def _style_button(b, kind):
+    b.FlatStyle = FlatStyle.Flat
+    if kind == u"primary":
+        b.BackColor = THEME_BLUE
+        b.ForeColor = Color.White
+        b.Font      = Font(b.Font, FontStyle.Bold)
+    elif kind == u"danger":
+        b.BackColor = THEME_STOP
+        b.ForeColor = Color.White
+        b.Font      = Font(b.Font, FontStyle.Bold)
+    else:
+        b.BackColor = THEME_GREY
+        b.ForeColor = Color.Black
+
+def apply_theme(root):
+    for c in root.Controls:
+        try:
+            if isinstance(c, Button):
+                t = c.Text
+                if t == u"Stop":
+                    _style_button(c, u"danger")
+                elif t in PRIMARY_TEXTS:
+                    _style_button(c, u"primary")
+                else:
+                    _style_button(c, u"secondary")
+            elif isinstance(c, GroupBox):
+                saved = [(k, k.ForeColor) for k in c.Controls]
+                c.ForeColor = THEME_BLUE_DARK
+                for (k, fc) in saved:
+                    k.ForeColor = fc
+                apply_theme(c)
+            elif isinstance(c, Panel):
+                apply_theme(c)
+        except:
+            pass
 
 # ---------------------------------------------------------------
 # Scroll'u devre disi birakan ComboBox
@@ -59,7 +114,7 @@ class ProgressForm(Form):
         self.lbl_detail = Label()
         self.lbl_detail.Text      = u""
         self.lbl_detail.Font      = base_font
-        self.lbl_detail.ForeColor = Color.DimGray
+        self.lbl_detail.ForeColor = Color.FromArgb(64, 64, 64)
         self.lbl_detail.Location  = Point(14, 38)
         self.lbl_detail.Size      = Size(390, 40)
         self.Controls.Add(self.lbl_detail)
@@ -68,7 +123,7 @@ class ProgressForm(Form):
         btn_stop.Text      = u"Stop"
         btn_stop.Font      = font_bold
         btn_stop.ForeColor = Color.White
-        btn_stop.BackColor = Color.FromArgb(200, 50, 50)
+        btn_stop.BackColor = THEME_STOP
         btn_stop.FlatStyle = FlatStyle.Standard
         btn_stop.Location  = Point(314, 10)
         btn_stop.Size      = Size(90, 32)
@@ -76,6 +131,7 @@ class ProgressForm(Form):
         self.Controls.Add(btn_stop)
 
         self.FormClosing += self._on_closing
+        apply_theme(self)
 
     def _on_stop(self, sender, e):
         self._cancelled[0] = True
@@ -97,6 +153,45 @@ class ProgressForm(Form):
         self.lbl_detail.Text  = detail
         Application.DoEvents()
 
+    # Kontak basligi + altinda deneme sonuclari
+    def enable_log(self, titles):
+        self.ClientSize = Size(640, 470)
+        self.lbl_detail.Size = Size(500, 20)
+        for c in self.Controls:
+            if isinstance(c, Button):
+                c.Location = Point(536, 10)
+        self.tv_log = TreeView()
+        self.tv_log.Location      = Point(14, 70)
+        self.tv_log.Size          = Size(612, 386)
+        self.tv_log.Font          = Font("Segoe UI", 9.5, FontStyle.Regular)
+        self.tv_log.ItemHeight    = 22
+        self.tv_log.ShowLines     = True
+        self.tv_log.ShowPlusMinus = True
+        self.tv_log.ShowRootLines = True
+        self.Controls.Add(self.tv_log)
+        self._log_nodes = []
+        for t in titles:
+            n = TreeNode(t)
+            n.ForeColor = THEME_BLUE_DARK
+            self.tv_log.Nodes.Add(n)
+            n.Expand()
+            self._log_nodes.append(n)
+        self.CenterToScreen()
+        Application.DoEvents()
+
+    def log_trial(self, i, text, ok=None):
+        try:
+            n  = self._log_nodes[i]
+            ch = n.Nodes.Add(text)
+            if ok is True:
+                ch.ForeColor = THEME_OK
+            n.Expand()
+            ch.EnsureVisible()
+        except:
+            pass
+        Application.DoEvents()
+
+
 # ---------------------------------------------------------------
 # Sure formatla
 # ---------------------------------------------------------------
@@ -114,7 +209,10 @@ def disp_type(cmd_type):
     return u"PRELOAD"
 
 def fmt_val(x):
-    return u"%.6g" % x
+    t = (u"%.8f" % x).rstrip(u"0").rstrip(u".")
+    if t == u"" or t == u"-":
+        t = u"0"
+    return t
 
 # ---------------------------------------------------------------
 # Kontak altindaki mevcut cid numarasini bul
@@ -226,6 +324,11 @@ def find_existing_solution_cmd(analysis, cmd_type, step_num):
     for child in analysis.Children:
         if "CommandSnippet" not in child.GetType().ToString():
             continue
+        try:
+            if child.Name.startswith(u"PRELOAD_ITER_STEP"):
+                continue
+        except:
+            pass
         try:
             snum = None
             try:
@@ -354,40 +457,9 @@ def get_workdir(analysis):
 # ---------------------------------------------------------------
 SNIP_PREFIX = u"PRELOAD_ITER_STEP"
 
-def build_read_block(idx, fcid, step, cs_id):
-    fname = u"pi_item" + str(idx)
-    L = []
-    L.append(u"! --- preload iteration read: cid_" + str(fcid) + u", end of step " + str(step))
-    L.append(u"/POST1")
-    L.append(u"SET," + str(step) + u",LAST")
-    L.append(u"ESEL,S,REAL,,cid_" + str(fcid))
-    L.append(u"ESEL,R,ENAME,,171,177")
-    L.append(u"NSLE,S")
-    if cs_id > 0:
-        L.append(u"RSYS," + str(cs_id))
-        L.append(u"FSUM,RSYS")
-    else:
-        L.append(u"RSYS,0")
-        L.append(u"FSUM")
-    L.append(u"*GET,pi_fx,FSUM,0,ITEM,FX")
-    L.append(u"*GET,pi_fy,FSUM,0,ITEM,FY")
-    L.append(u"*GET,pi_fz,FSUM,0,ITEM,FZ")
-    L.append(u"*CFOPEN," + fname + u",txt")
-    L.append(u"*VWRITE,pi_fx,pi_fy,pi_fz")
-    L.append(u"(E20.10,E20.10,E20.10)")
-    L.append(u"*CFCLOS")
-    L.append(u"ALLSEL,ALL")
-    L.append(u"RSYS,0")
-    L.append(u"FINISH")
-    L.append(u"/SOLU")
-    return L
-
 def build_abort_block():
-    return [u"! --- preload iteration abort",
-            u"*CFOPEN,file,abt",
-            u"*VWRITE",
-            u"('nonlinear')",
-            u"*CFCLOS"]
+    # /EOF: giris dosyasini burada bitirir; kontrol step'inden sonrasi cozulmez (restart-safe)
+    return [u"! --- preload iteration: stop the solver here", u"/EOF"]
 
 def remove_stale_snippets(analysis):
     for ch in list(analysis.Children):
@@ -398,29 +470,13 @@ def remove_stale_snippets(analysis):
             pass
 
 def add_read_snippets(analysis, items, ctrl_max):
-    by_step = {}
-    for it in items:
-        k = it["step"] + 1
-        if k not in by_step:
-            by_step[k] = []
-        by_step[k].append(it)
-    abort_k = ctrl_max + 1
-    if abort_k not in by_step:
-        by_step[abort_k] = []
-    snips = []
-    for k in sorted(by_step.keys()):
-        lines = []
-        for it in by_step[k]:
-            lines.extend(build_read_block(it["idx"], it["fcid"], it["step"], it["cs_id"]))
-        if k == abort_k:
-            lines.extend(build_abort_block())
-        cmd       = analysis.AddCommandSnippet()
-        cmd.Name  = SNIP_PREFIX + str(k)
-        cmd.Input = u"\n".join(lines)
-        cmd.StepSelectionMode = SequenceSelectionType.ByNumber
-        cmd.StepNumber        = k
-        snips.append(cmd)
-    return snips
+    # Kontrol step'inden sonraki step'in basinda cozucuyu durdur (abort dosyasi)
+    cmd       = analysis.AddCommandSnippet()
+    cmd.Name  = SNIP_PREFIX + str(ctrl_max + 1)
+    cmd.Input = u"\n".join(build_abort_block())
+    cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+    cmd.StepNumber        = ctrl_max + 1
+    return [cmd]
 
 def delete_snippets(snips):
     for c in snips:
@@ -432,35 +488,12 @@ def delete_snippets(snips):
 def clean_iter_files(workdir, items):
     if workdir is None:
         return
-    names = [u"file.abt"] + [u"pi_item" + str(it["idx"]) + u".txt" for it in items]
-    for n in names:
-        try:
-            p = os.path.join(workdir, n)
-            if os.path.exists(p):
-                os.remove(p)
-        except:
-            pass
-
-def read_apdl_value(workdir, idx, dir_code):
-    p = os.path.join(workdir, u"pi_item" + str(idx) + u".txt")
-    f = open(p, "r")
     try:
-        txt = f.read()
-    finally:
-        f.close()
-    vals = [float(v) for v in txt.replace("D", "E").split()]
-    fx, fy, fz = vals[0], vals[1], vals[2]
-    if dir_code == u"Total":
-        return math.sqrt(fx * fx + fy * fy + fz * fz)
-    if dir_code[0] == u"X":
-        v = fx
-    elif dir_code[0] == u"Y":
-        v = fy
-    else:
-        v = fz
-    if dir_code.endswith(u"-"):
-        v = -v
-    return v
+        p = os.path.join(workdir, u"file.abt")
+        if os.path.exists(p):
+            os.remove(p)
+    except:
+        pass
 
 # Kontak kimligi (ayni kontagi tekrar saymamak icin)
 def ckey(c):
@@ -471,20 +504,19 @@ def ckey(c):
 
 def add_probe_comment(it, iters):
     F = it["F"]
-    extra = u""
     if it.get("F_final") is not None:
         F = it["F_final"]
-        extra = u" (iteration-time value: " + fmt_val(it["F"]) + u" N)"
-    status = u"within tolerance" if it["converged"] else u"NOT within tolerance"
-    txt = (u"Preload iteration result: interference " + fmt_val(it["x"]) + u" mm applied on '" +
-           it["contact"].Name + u"' (cid_" + str(it["cid"]) + u", step " + str(it["step"]) +
-           u") gives a preload of " + fmt_val(F) + u" N" + extra + u" (" + it["dir"] +
-           u") read at '" + it["fcontact"].Name + u"' (cid_" + str(it["fcid"]) + u"). Target " +
-           fmt_val(it["target"]) + u" N +/-" + fmt_val(it["tol"]) + u"%  ->  " + status +
-           u".  Iterations: " + str(iters) + u".")
+    status = u"OK" if it["converged"] else u"NOT within tolerance"
+    lines = []
+    lines.append(u"Interference: " + fmt_val(it["x"]) + u" mm @ " + it["contact"].Name + u" (step " + str(it["step"]) + u")")
+    lines.append(u"Preload: " + fmt_val(F / 1000.0) + u" kN (" + it["dir"] + u") @ " + it["fcontact"].Name)
+    lines.append(u"Target: " + fmt_val(it["target"] / 1000.0) + u" kN +/-" + fmt_val(it["tol"]) + u"%  ->  " + status +
+                 u"  (" + str(len(it["hist"])) + u" trials)")
+    for n, h in enumerate(it["hist"]):
+        lines.append(str(n + 1) + u") " + fmt_val(h[0]) + u" mm -> " + fmt_val(h[1] / 1000.0) + u" kN")
     cm = it["probe"].AddComment()
     try:
-        cm.Text = txt
+        cm.Text = u"\n".join(lines)
     except:
         pass
 
@@ -509,6 +541,7 @@ def create_probe(solution, name, contact, cs_obj):
 def read_probe_value(fr, t, dir_code):
     try:
         fr.DisplayTime = make_time(t)
+        fr.EvaluateAllResults()      # zaman degistikten sonra tekrar evaluate gerekir
     except:
         pass
     if dir_code == u"Total":
@@ -519,10 +552,7 @@ def read_probe_value(fr, t, dir_code):
         q = fr.YAxis
     else:
         q = fr.ZAxis
-    val = float(q.Value)
-    if dir_code.endswith(u"-"):
-        val = -val
-    return val
+    return abs(float(q.Value))
 
 def solve_ok(analysis):
     try:
@@ -560,7 +590,316 @@ def next_value(hist, target):
         xn = 0.1 * x1
     return xn
 
-def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancelled):
+# ===============================================================
+#  RESTART (Ansys restart ile degismeyen on step'leri tekrar cozmemek)
+#  - Restart ayarlari kullanicinin buldugu gibi geri yuklenir (restore)
+#  - Restart noktasindan ONCE uygulanan Rmodif / MP,MU komutlari restart'ta
+#    kaybolur; restart step'inin basinda (carry snippet) yeniden uygulanir
+# ===============================================================
+RS_STATS = {"restart": 0, "scratch": 0, "skipped": 0}
+RS_WARN  = []
+
+def rs_norm(n):
+    return n.replace(" ", "").lower()
+
+def rs_set_enum(obj, prop, candidates):
+    """Enum ozelligini isimle atar; zaten ayni ise dokunmaz."""
+    try:
+        cur = getattr(obj, prop)
+    except Exception:
+        return False
+    for c in candidates:
+        if rs_norm(unicode(str(cur))) == rs_norm(c):
+            return True
+    try:
+        t = cur.GetType()
+        names = list(System.Enum.GetNames(t))
+    except Exception:
+        return False
+    norm = dict([(rs_norm(n), n) for n in names])
+    for c in candidates:
+        if rs_norm(c) in norm:
+            try:
+                setattr(obj, prop, System.Enum.Parse(t, norm[rs_norm(c)]))
+                return True
+            except Exception:
+                return False
+    return False
+
+def rs_step_end_time(settings, step):
+    cur = None
+    try:
+        cur = settings.CurrentStepNumber
+    except Exception:
+        pass
+    settings.CurrentStepNumber = step
+    t = float(settings.StepEndTime.Value)
+    if cur is not None:
+        try:
+            settings.CurrentStepNumber = cur
+        except Exception:
+            pass
+    return t
+
+def rs_snippet_step(ch):
+    try:
+        if "ByNumber" not in str(ch.StepSelectionMode):
+            return None
+    except Exception:
+        return None
+    snum = None
+    try:
+        snum = int(ch.StepNumber)
+    except Exception:
+        pass
+    try:
+        snum = int(ch.InternalObject.StepNumber)
+    except Exception:
+        pass
+    return snum
+
+def rs_parse_solve_out(workdir):
+    info = {"restart_from": None, "elapsed": None, "cp": None}
+    try:
+        f = open(os.path.join(workdir, u"solve.out"), "r")
+        try:
+            lines = f.read().splitlines()
+        finally:
+            f.close()
+    except Exception:
+        return info
+    for l in lines:
+        m = re.search(r"RESTART PREVIOUSLY RUN ANALYSIS FROM LOADSTEP\s+(\d+)", l)
+        if m:
+            info["restart_from"] = int(m.group(1))
+        m = re.search(r"Elapsed Time \(sec\)\s*=\s*([0-9.]+)", l)
+        if m:
+            info["elapsed"] = float(m.group(1))
+        m = re.search(r"CP Time\s+\(sec\)\s*=\s*([0-9.]+)", l)
+        if m:
+            info["cp"] = float(m.group(1))
+    return info
+
+def rs_add_carry(analysis, step, lines):
+    cmd       = analysis.AddCommandSnippet()
+    cmd.Name  = SNIP_PREFIX + u"_CARRY"
+    cmd.Input = u"\n".join([u"! re-apply real constants / friction that a restart does not carry over"] + lines)
+    cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+    cmd.StepNumber        = step
+    return cmd
+
+class RestartHelper(object):
+    """
+        rh = RestartHelper(analysis, workdir);  rh.setup()       # ayarlari kaydet + restart ayarlarini yap
+        rh.scratch();  info = rh.solve()                         # sifirdan (restart noktalari uretilir)
+        if rh.from_end_of_step(k):                               # k. step sonundan restart
+            lines, warn = rh.carry_lines(k)                      # restart'ta kaybolan komutlar
+            carry = rs_add_carry(analysis, k + 1, lines)
+        info = rh.solve()                                        # info["restart_from"] == k ise restart kullanildi
+        rh.restore()                                             # kullanicinin ayarlarini oldugu gibi geri yukle
+    """
+    PROPS = ["GenerateRestartPoints", "SaveAtLoadStep", "SaveAtSubstep", "RetainFilesAfterFullSolve",
+             "CombineRestartFiles", "DeleteUnneededFiles", "RestartType", "CurrentRestartPoint"]
+    RE_RMODIF = re.compile(r"^\s*Rmodif\s*,\s*([^,\s]+)\s*,\s*([^,\s]+)\s*,", re.I)
+    RE_MP     = re.compile(r"^\s*MP\s*,\s*MU\s*,\s*([^,\s]+)\s*,", re.I)
+
+    def __init__(self, analysis, workdir, combine=u"Yes"):
+        self.analysis = analysis
+        self.settings = analysis.AnalysisSettings
+        self.workdir  = workdir
+        self.combine  = combine
+        self.saved    = {}
+
+    def setup(self):
+        s = self.settings
+        for p in RestartHelper.PROPS:
+            try:
+                self.saved[p] = getattr(s, p)
+            except Exception:
+                pass
+        rs_set_enum(s, "GenerateRestartPoints", ["Manual"])
+        rs_set_enum(s, "SaveAtLoadStep", ["All"])
+        rs_set_enum(s, "SaveAtSubstep", ["Last"])
+        rs_set_enum(s, "RetainFilesAfterFullSolve", ["Yes"])
+        rs_set_enum(s, "CombineRestartFiles", [self.combine])
+        try:
+            if getattr(s, "DeleteUnneededFiles") is not False:
+                s.DeleteUnneededFiles = False
+        except Exception:
+            pass
+        rs_set_enum(s, "RestartType", ["Manual"])
+
+    def restore(self):
+        """Kullanicinin restart ayarlarini bulundugu gibi geri yukler."""
+        s = self.settings
+        for p in ["RestartType", "CurrentRestartPoint", "GenerateRestartPoints", "SaveAtLoadStep",
+                  "SaveAtSubstep", "RetainFilesAfterFullSolve", "CombineRestartFiles", "DeleteUnneededFiles"]:
+            if p in self.saved:
+                try:
+                    setattr(s, p, self.saved[p])
+                except Exception:
+                    pass
+
+    def scratch(self):
+        rs_set_enum(self.settings, "RestartType", ["Manual"])
+        try:
+            self.settings.CurrentRestartPoint = 0
+        except Exception:
+            pass
+
+    def find_point(self, loadstep, end_time=None):
+        s = self.settings
+        rs_set_enum(s, "RestartType", ["Manual"])
+        limit = 20
+        try:
+            limit = max(limit, int(s.NumberOfRestartPoints) + 3)
+        except Exception:
+            pass
+        for idx in range(0, limit):
+            try:
+                s.CurrentRestartPoint = idx
+            except Exception:
+                break
+            try:
+                ls = int(s.RestartAtLoadStep)
+                tm = float(s.RestartAtTime)
+            except Exception:
+                continue
+            if ls == loadstep and (end_time is None or abs(tm - end_time) <= 1e-6 * max(1.0, abs(end_time))):
+                return idx
+        return None
+
+    def from_end_of_step(self, k):
+        """k. load step'in sonundaki restart noktasini secer; yoksa sifirdan baslar (False)."""
+        if k is None or k < 1:
+            self.scratch()
+            return False
+        try:
+            et = rs_step_end_time(self.settings, k)
+        except Exception:
+            et = None
+        idx = self.find_point(k, et)
+        if idx is None:
+            self.scratch()
+            return False
+        try:
+            self.settings.CurrentRestartPoint = idx
+        except Exception:
+            self.scratch()
+            return False
+        return True
+
+    def _key(self, line):
+        m = RestartHelper.RE_RMODIF.match(line)
+        if m:
+            return (u"rmodif", m.group(1).lower(), m.group(2))
+        m = RestartHelper.RE_MP.match(line)
+        if m:
+            return (u"mp", m.group(1).lower())
+        return None
+
+    def carry_lines(self, upto):
+        """
+        Step <= upto snippet'lerindeki Rmodif / MP,MU satirlarinin son degerleri.
+        upto+1'deki snippet'lerde zaten tekrar verilenler cikarilir.
+        Donen: (satirlar, uyari_listesi)  - uyari: restart'ta yeniden uygulanmayacak komut iceren snippet adlari
+        """
+        snips = []
+        idx = 0
+        for ch in self.analysis.Children:
+            idx += 1
+            try:
+                if "CommandSnippet" not in ch.GetType().ToString():
+                    continue
+                if ch.Name.startswith(SNIP_PREFIX):
+                    continue
+                st = rs_snippet_step(ch)
+                if st is None:
+                    continue
+                snips.append((st, idx, ch))
+            except Exception:
+                pass
+        snips.sort(key=lambda t: (t[0], t[1]))
+        entries  = {}
+        order    = []
+        explicit = set()
+        warn     = []
+        for (st, i, ch) in snips:
+            try:
+                text = ch.Input
+            except Exception:
+                continue
+            for raw in text.split(u"\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                key = self._key(line)
+                if st == upto + 1:
+                    if key:
+                        explicit.add(key)
+                    continue
+                if st > upto:
+                    continue
+                if key:
+                    entries[key] = line
+                    if key not in order:
+                        order.append(key)
+                elif not (line.startswith(u"!") or line.upper().startswith(u"/COM")):
+                    if ch.Name not in warn:
+                        warn.append(ch.Name)
+        return [entries[k] for k in order if k not in explicit], warn
+
+    def solve(self):
+        t0 = time.time()
+        err = None
+        try:
+            self.analysis.Solve(True)
+        except Exception as ex:
+            err = unicode(str(ex))
+        wall = time.time() - t0
+        try:
+            p = os.path.join(self.workdir, u"file.abt")
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        info = rs_parse_solve_out(self.workdir) if self.workdir else {"restart_from": None}
+        info["wall"]  = wall
+        info["error"] = err
+        return info
+
+def run_iteration(analysis, items, max_iter, use_cut, final_solve, use_restart, prog, cancelled):
+    """Restart kullaniliyorsa ayarlar kaydedilir ve is bitince kullanicinin buldugu gibi geri yuklenir."""
+    RS_STATS["restart"] = 0
+    RS_STATS["scratch"] = 0
+    RS_STATS["skipped"] = 0
+    del RS_WARN[:]
+    workdir = get_workdir(analysis)
+    rh = None
+    if use_restart and workdir:
+        rh = RestartHelper(analysis, workdir)
+        try:
+            rh.setup()
+        except Exception:
+            try:
+                rh.restore()
+            except Exception:
+                pass
+            rh = None
+    try:
+        return _run_iteration_core(analysis, items, max_iter, use_cut, final_solve, rh, prog, cancelled)
+    finally:
+        try:
+            remove_stale_snippets(analysis)
+        except Exception:
+            pass
+        if rh is not None:
+            try:
+                rh.restore()
+            except Exception:
+                pass
+
+def _run_iteration_core(analysis, items, max_iter, use_cut, final_solve, rh, prog, cancelled):
     settings    = analysis.AnalysisSettings
     solution    = analysis.Solution
     total_steps = get_step_count(analysis)
@@ -597,8 +936,22 @@ def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancell
         it["F"]         = None
         it["F_final"]   = None
 
+    titles = []
+    for n_i, it in enumerate(items):
+        t = str(n_i + 1) + u".  " + it["contact"].Name
+        if ckey(it["fcontact"]) != ckey(it["contact"]):
+            t += u"   ->   force @ " + it["fcontact"].Name
+        t += u"   [target " + fmt_val(it["target"] / 1000.0) + u" kN +/-" + fmt_val(it["tol"]) + u"%]"
+        titles.append(t)
+    try:
+        prog.enable_log(titles)
+    except:
+        pass
+
     iters_done = 0
     snips      = []
+    carry      = None
+    rh_chain   = False
     try:
         if do_cut:
             snips = add_read_snippets(analysis, items, ctrl_max)
@@ -616,52 +969,101 @@ def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancell
                     set_cmd_value(analysis, u"interference", it["step"], it["cid"], fmt_val(it["x"]))
                     it["written_x"] = it["x"]
 
-            # 2) coz
+            # 2) restart plani: degisen en erken step'in bir oncesinden basla
+            expected = None
+            where    = u"From scratch"
+            if rh is not None:
+                if k > 1 and rh_chain:
+                    changed = [it["step"] for it in items
+                               if it["solved_x"] is None or abs(it["solved_x"] - it["x"]) > 0.0]
+                    s_min    = min(changed) if changed else ctrl_max
+                    expected = s_min - 1
+                    if expected >= 1 and rh.from_end_of_step(expected):
+                        lines, warn = rh.carry_lines(expected)
+                        for w in warn:
+                            if w not in RS_WARN:
+                                RS_WARN.append(w)
+                        if lines:
+                            carry = rs_add_carry(analysis, expected + 1, lines)
+                        where = u"Restart from the end of step " + str(expected) + u" (steps 1.." + str(expected) + u" not re-solved)"
+                    else:
+                        rh.scratch()
+                        expected = None
+                else:
+                    rh.scratch()
+
+            # 3) coz
             if do_cut:
                 prog.update(tag + u"  -  solving",
-                            u"Solver is aborted after step " + str(ctrl_max) + u" of " + str(total_steps))
+                            where + u"  |  solver stops after step " + str(ctrl_max) + u" of " + str(total_steps))
                 clean_iter_files(workdir, items)
             else:
-                prog.update(tag + u"  -  solving", u"Full analysis")
+                prog.update(tag + u"  -  solving", where + u"  |  full analysis")
             solve_err = None
-            try:
-                analysis.Solve(True)
-            except Exception as ex:
-                solve_err = u"Solve error: " + unicode(str(ex))
-
-            # 3) oku
-            try:
-                if do_cut:
-                    # abort edilen cozum "failed" gorunebilir; sonuc dosyalari belirleyici
-                    for it in items:
-                        F = read_apdl_value(workdir, it["idx"], it["dir"])
-                        it["F"] = F
-                        it["solved_x"] = it["x"]
-                        it["hist"].append((it["x"], F))
+            if rh is not None:
+                info = rh.solve()
+                if info.get("error"):
+                    solve_err = u"Solve error: " + info["error"]
+                rf = info.get("restart_from")
+                if rf is not None and rf != expected:
+                    err = (u"Unexpected restart: solver restarted from load step " + unicode(str(rf)) +
+                           u", expected " + unicode(str(expected)) + u".")
+                    break
+                if rf is not None:
+                    RS_STATS["restart"] += 1
+                    RS_STATS["skipped"] += rf
                 else:
+                    RS_STATS["scratch"] += 1
+            else:
+                try:
+                    analysis.Solve(True)
+                except Exception as ex:
+                    solve_err = u"Solve error: " + unicode(str(ex))
+
+            # 4) oku: abort/EOF ile durdurulan cozumde de tamamlanan step'ler icin probe'lar evaluate edilir
+            try:
+                if not do_cut:
                     if solve_err is None and not solve_ok(analysis):
                         solve_err = u"Solution did not finish successfully (status: " + unicode(str(analysis.Solution.Status)) + u")"
                     if solve_err is not None:
                         err = solve_err
                         break
+                try:
                     solution.EvaluateAllResults()
-                    for it in items:
-                        F = read_probe_value(it["probe"], it["end_time"], it["dir"])
-                        it["F"] = F
-                        it["solved_x"] = it["x"]
-                        it["hist"].append((it["x"], F))
+                except Exception:
+                    pass
+                for it in items:
+                    try:
+                        it["probe"].EvaluateAllResults()
+                    except Exception:
+                        pass
+                    F = read_probe_value(it["probe"], it["end_time"], it["dir"])
+                    it["F"] = F
+                    it["solved_x"] = it["x"]
+                    it["hist"].append((it["x"], F))
+                rh_chain = True
             except Exception as ex2:
                 err = u"Could not read results: " + unicode(str(ex2))
                 if solve_err is not None:
                     err = err + u"  |  " + solve_err
                 break
 
-            # 4) yakinsama kontrolu + yeni deger
+            if carry is not None:
+                try:
+                    carry.Delete()
+                except Exception:
+                    pass
+                carry = None
+
+            # 5) yakinsama kontrolu + yeni deger
             all_ok = True
             for it in items:
                 it["converged"] = within_tol(it["F"], it["target"], it["tol"])
                 if not it["converged"]:
                     all_ok = False
+                prog.log_trial(it["idx"],
+                               u"Trial " + str(k) + u":   preload " + fmt_val(it["x"]) + u" mm   ->   force " +
+                               fmt_val(it["F"] / 1000.0) + u" kN   [" + (u"OK" if it["converged"] else u"out of tolerance") + u"]", it["converged"])
             if all_ok or k == max_iter:
                 break
             for it in items:
@@ -672,7 +1074,7 @@ def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancell
         if do_cut:
             clean_iter_files(workdir, items)
 
-    # 5) bitis: EN SON cozulen interference degerleri ile devam
+    # 6) bitis: EN SON cozulen interference degerleri ile devam
     if err is None:
         for it in items:
             if len(it["hist"]) == 0:
@@ -688,9 +1090,36 @@ def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancell
         full_valid = False
         if do_cut:
             if final_solve and not cancelled[0] and have_hist:
-                prog.update(u"Final full solve...", u"All " + str(total_steps) + u" steps")
+                prog.update(u"Final solve...", u"All " + str(total_steps) + u" steps")
                 try:
-                    analysis.Solve(True)
+                    expected = None
+                    if rh is not None:
+                        if rh_chain and rh.from_end_of_step(ctrl_max):
+                            lines, warn = rh.carry_lines(ctrl_max)
+                            for w in warn:
+                                if w not in RS_WARN:
+                                    RS_WARN.append(w)
+                            if lines:
+                                carry = rs_add_carry(analysis, ctrl_max + 1, lines)
+                            expected = ctrl_max
+                            prog.update(u"Final solve...", u"Restart from the end of step " + str(ctrl_max) +
+                                        u" (steps 1.." + str(ctrl_max) + u" not re-solved)")
+                        else:
+                            rh.scratch()
+                        info = rh.solve()
+                        if info.get("error"):
+                            raise Exception(info["error"])
+                        rf = info.get("restart_from")
+                        if rf is not None and rf != expected:
+                            raise Exception(u"Unexpected restart from load step " + unicode(str(rf)) +
+                                            u" (expected " + unicode(str(expected)) + u")")
+                        if rf is not None:
+                            RS_STATS["restart"] += 1
+                            RS_STATS["skipped"] += rf
+                        else:
+                            RS_STATS["scratch"] += 1
+                    else:
+                        analysis.Solve(True)
                     full_valid = solve_ok(analysis)
                     if not full_valid:
                         err = u"Final solve did not finish successfully (status: " + unicode(str(analysis.Solution.Status)) + u")"
@@ -704,10 +1133,17 @@ def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancell
             prog.update(u"Reading final reaction forces...", u"")
             try:
                 solution.EvaluateAllResults()
-                for it in items:
-                    it["F_final"] = read_probe_value(it["probe"], it["end_time"], it["dir"])
             except:
                 pass
+            for it in items:
+                try:
+                    it["probe"].EvaluateAllResults()
+                except:
+                    pass
+                try:
+                    it["F_final"] = read_probe_value(it["probe"], it["end_time"], it["dir"])
+                except:
+                    pass
 
         # Probe'lara bilgi amacli comment
         if have_hist:
@@ -803,6 +1239,7 @@ class TypeSelectForm(Form):
         btn_cancel.DialogResult = DialogResult.Cancel
         self.Controls.Add(btn_cancel)
         self.CancelButton = btn_cancel
+        apply_theme(self)
 
     def _build_mode_panel(self):
         self._clear_controls()
@@ -859,6 +1296,7 @@ class TypeSelectForm(Form):
         btn_cancel.DialogResult = DialogResult.Cancel
         self.Controls.Add(btn_cancel)
         self.CancelButton = btn_cancel
+        apply_theme(self)
 
     def _build_value_panel(self, cmd_type):
         self._clear_controls()
@@ -975,6 +1413,7 @@ class TypeSelectForm(Form):
         self.Controls.Add(btn_next)
 
         self.txt_value.Focus()
+        apply_theme(self)
 
     def _on_friction(self, sender, e):
         self.selected_type = u"friction"
@@ -1141,6 +1580,7 @@ class ContactSelectForm(Form):
         btn_apply.FlatStyle = FlatStyle.Standard
         btn_apply.Click    += self._on_apply
         self.Controls.Add(btn_apply)
+        apply_theme(self)
 
         self._updating = False
 
@@ -1197,11 +1637,17 @@ class ContactSelectForm(Form):
 # ADIM 3 (sadece Preload > Iteration): kontak basina ayarlar
 # ---------------------------------------------------------------
 class IterParamForm(Form):
-    DIRS = [u"X+", u"X-", u"Y+", u"Y-", u"Z+", u"Z-", u"Total"]
+    DIRS = [u"X", u"Y", u"Z", u"Total"]
 
     def __init__(self, selected, step_count, cs_names, all_contacts):
         self.Text            = u"Preload Iteration Settings"
-        self.ClientSize      = Size(790, 640)
+        n_rows   = len(selected)
+        vis_rows = min(n_rows, 6)
+        pnl_h    = vis_rows * 70 + 4
+        y_fill   = 12 + pnl_h + 6
+        y_grp    = y_fill + 34
+        y_btn    = y_grp + 138 + 14
+        self.ClientSize      = Size(790, y_btn + 32 + 14)
         self.StartPosition   = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.FixedDialog
         self.MaximizeBox     = False
@@ -1210,6 +1656,7 @@ class IterParamForm(Form):
         self.max_iter        = 10
         self.truncate        = True
         self.final_solve     = True
+        self.use_restart     = True
         self._selected       = selected
         self._all_contacts   = all_contacts
         self._rows           = []
@@ -1232,7 +1679,7 @@ class IterParamForm(Form):
         self.pnl = Panel()
         self.pnl.AutoScroll = True
         self.pnl.Location   = Point(14, 12)
-        self.pnl.Size       = Size(762, 408)
+        self.pnl.Size       = Size(762, pnl_h)
         self.Controls.Add(self.pnl)
 
         row_h = 70
@@ -1240,13 +1687,17 @@ class IterParamForm(Form):
             rp = Panel()
             rp.Location  = Point(0, i * row_h)
             rp.Size      = Size(736, row_h - 4)
-            rp.BackColor = Color.White if (i % 2 == 0) else Color.FromArgb(240, 245, 252)
+            rp.BackColor = THEME_ROW_A if (i % 2 == 0) else THEME_ROW_B
             self.pnl.Controls.Add(rp)
 
             # --- satir 1: interference kontagi + force okunacak kontak
             y1 = 6
-            rp.Controls.Add(mk_label(u"Preload on:", 4, y1, 72, True))
-            rp.Controls.Add(mk_label(contact.Name, 78, y1, 290))
+            lbl_no = mk_label(str(i + 1) + u".", 4, y1, 30, True)
+            lbl_no.ForeColor = THEME_BLUE_DARK
+            lbl_no.Font      = Font("Segoe UI", 10.0, FontStyle.Bold)
+            rp.Controls.Add(lbl_no)
+            rp.Controls.Add(mk_label(u"Preload on:", 36, y1, 72, True))
+            rp.Controls.Add(mk_label(contact.Name, 110, y1, 258))
             rp.Controls.Add(mk_label(u"Read force at:", 376, y1, 88, True))
 
             cb_force = make_no_scroll_combo()
@@ -1284,7 +1735,7 @@ class IterParamForm(Form):
             cb_dir.Size     = Size(62, 24)
             for d in IterParamForm.DIRS:
                 cb_dir.Items.Add(d)
-            cb_dir.SelectedIndex = 4
+            cb_dir.SelectedIndex = 2
             rp.Controls.Add(cb_dir)
 
             rp.Controls.Add(mk_label(u"CS", 198, y2, 24))
@@ -1300,9 +1751,9 @@ class IterParamForm(Form):
                 cb_cs.SelectedIndex = 0
             rp.Controls.Add(cb_cs)
 
-            rp.Controls.Add(mk_label(u"Target [N]", 382, y2, 62))
+            rp.Controls.Add(mk_label(u"Target [kN]", 382, y2, 62))
             t_target = TextBox()
-            t_target.Text     = u"1000"
+            t_target.Text     = u"1"
             t_target.Location = Point(446, y2)
             t_target.Size     = Size(68, 24)
             rp.Controls.Add(t_target)
@@ -1327,7 +1778,7 @@ class IterParamForm(Form):
         btn_fill.Text      = u"Copy first row settings to all"
         btn_fill.Font      = base_font
         btn_fill.FlatStyle = FlatStyle.Standard
-        btn_fill.Location  = Point(14, 426)
+        btn_fill.Location  = Point(14, y_fill)
         btn_fill.Size      = Size(210, 26)
         btn_fill.Click    += self._on_fill
         self.Controls.Add(btn_fill)
@@ -1335,8 +1786,8 @@ class IterParamForm(Form):
         grp = GroupBox()
         grp.Text     = u"Iteration Options"
         grp.Font     = font_title
-        grp.Location = Point(14, 460)
-        grp.Size     = Size(762, 112)
+        grp.Location = Point(14, y_grp)
+        grp.Size     = Size(762, 138)
         self.Controls.Add(grp)
 
         l2 = Label()
@@ -1353,7 +1804,7 @@ class IterParamForm(Form):
         grp.Controls.Add(self.t_maxit)
 
         self.chk_trunc = CheckBox()
-        self.chk_trunc.Text     = u"Stop each solve right after the last control step (APDL reads the force and aborts; step settings are not touched)"
+        self.chk_trunc.Text     = u"Stop each solve right after the last control step (solver is aborted, forces are read from the evaluated probes)"
         self.chk_trunc.Font     = base_font
         self.chk_trunc.Checked  = True
         self.chk_trunc.Location = Point(12, 52)
@@ -1368,11 +1819,19 @@ class IterParamForm(Form):
         self.chk_final.Size     = Size(740, 22)
         grp.Controls.Add(self.chk_final)
 
+        self.chk_restart = CheckBox()
+        self.chk_restart.Text     = u"Use Ansys restart: do not re-solve steps that did not change (your restart settings are restored afterwards)"
+        self.chk_restart.Font     = base_font
+        self.chk_restart.Checked  = True
+        self.chk_restart.Location = Point(12, 104)
+        self.chk_restart.Size     = Size(740, 22)
+        grp.Controls.Add(self.chk_restart)
+
         btn_back = Button()
         btn_back.Text      = u"< Back"
         btn_back.Font      = base_font
         btn_back.FlatStyle = FlatStyle.Standard
-        btn_back.Location  = Point(14, 594)
+        btn_back.Location  = Point(14, y_btn)
         btn_back.Size      = Size(90, 32)
         btn_back.Click    += self._on_back
         self.Controls.Add(btn_back)
@@ -1381,7 +1840,7 @@ class IterParamForm(Form):
         btn_cancel.Text         = u"Cancel"
         btn_cancel.Font         = base_font
         btn_cancel.FlatStyle    = FlatStyle.Standard
-        btn_cancel.Location     = Point(560, 594)
+        btn_cancel.Location     = Point(560, y_btn)
         btn_cancel.Size         = Size(90, 32)
         btn_cancel.DialogResult = DialogResult.Cancel
         self.Controls.Add(btn_cancel)
@@ -1391,10 +1850,11 @@ class IterParamForm(Form):
         btn_start.Text      = u"Start"
         btn_start.Font      = self.font_bold
         btn_start.FlatStyle = FlatStyle.Standard
-        btn_start.Location  = Point(666, 594)
+        btn_start.Location  = Point(666, y_btn)
         btn_start.Size      = Size(110, 32)
         btn_start.Click    += self._on_start
         self.Controls.Add(btn_start)
+        apply_theme(self)
 
     def _on_fill(self, sender, e):
         if len(self._rows) < 2:
@@ -1417,7 +1877,7 @@ class IterParamForm(Form):
         out = []
         try:
             for (contact, ex_cid, cb_force, cb_step, cb_dir, cb_cs, t_target, t_tol, t_x0) in self._rows:
-                target = float(t_target.Text.strip().replace(u",", u"."))
+                target = float(t_target.Text.strip().replace(u",", u".")) * 1000.0   # ekranda kN, icerde N
                 tol    = float(t_tol.Text.strip().replace(u",", u"."))
                 x0     = float(t_x0.Text.strip().replace(u",", u"."))
                 if target <= 0 or tol <= 0 or x0 <= 0:
@@ -1442,6 +1902,7 @@ class IterParamForm(Form):
         self.max_iter    = mi
         self.truncate    = self.chk_trunc.Checked
         self.final_solve = self.chk_final.Checked
+        self.use_restart = self.chk_restart.Checked
         self.DialogResult = DialogResult.OK
         self.Close()
 
@@ -1529,7 +1990,8 @@ def run_iteration_mode(model, static_analysis, select_form, par_form, start_cid)
     try:
         iters_done, err = run_iteration(static_analysis, items,
                                         par_form.max_iter, par_form.truncate,
-                                        par_form.final_solve, prog, cancelled_by_user)
+                                        par_form.final_solve, par_form.use_restart,
+                                        prog, cancelled_by_user)
     except Exception as ex:
         iters_done = 0
         err = u"Unexpected error: " + unicode(str(ex))
@@ -1538,17 +2000,17 @@ def run_iteration_mode(model, static_analysis, select_form, par_form, start_cid)
     prog.Close()
 
     lines = []
-    for it in items:
+    for n_i, it in enumerate(items):
         if not it.get("hist"):
-            lines.append(it["contact"].Name + u":  no result")
+            lines.append(str(n_i + 1) + u".  " + it["contact"].Name + u":  no result")
             continue
         status = u"OK" if it["converged"] else u"NOT within tolerance"
-        txt = (it["contact"].Name + u"  (interference, cid_" + str(it["cid"]) + u")\n" +
+        txt = (str(n_i + 1) + u".  " + it["contact"].Name + u"  (interference, cid_" + str(it["cid"]) + u")\n" +
                u"   force read at: " + it["fcontact"].Name + u"  (step " + str(it["step"]) + u", " + it["dir"] + u")\n" +
-               u"   interference " + fmt_val(it["x"]) + u" mm   |   target " + fmt_val(it["target"]) +
-               u" N (+/-" + fmt_val(it["tol"]) + u"%)   |   iteration result " + fmt_val(it["F"]) + u" N  [" + status + u"]")
+               u"   interference " + fmt_val(it["x"]) + u" mm   |   target " + fmt_val(it["target"] / 1000.0) +
+               u" kN (+/-" + fmt_val(it["tol"]) + u"%)   |   iteration result " + fmt_val(it["F"] / 1000.0) + u" kN  [" + status + u"]")
         if it.get("F_final") is not None:
-            txt += u"\n   final reaction force (full solve): " + fmt_val(it["F_final"]) + u" N"
+            txt += u"\n   final reaction force (full solve): " + fmt_val(it["F_final"] / 1000.0) + u" kN"
         lines.append(txt)
 
     head = u""
@@ -1557,10 +2019,18 @@ def run_iteration_mode(model, static_analysis, select_form, par_form, start_cid)
     elif cancelled_by_user[0]:
         head = u"Cancelled by user.\n\n"
 
+    rs_txt = u""
+    if par_form.use_restart and (RS_STATS["restart"] + RS_STATS["scratch"]) > 0:
+        rs_txt = (u"Restart        : " + str(RS_STATS["restart"]) + u" solve(s) restarted (" + str(RS_STATS["skipped"]) +
+                  u" step-solves skipped), " + str(RS_STATS["scratch"]) + u" solve(s) from scratch\n")
+        if RS_WARN:
+            rs_txt += (u"WARNING        : commands in snippet(s) " + u", ".join(RS_WARN) +
+                       u" (steps before the restart step) are NOT re-applied on restart.\n")
+
     MessageBox.Show(
         head +
         u"Iterations run : " + str(iters_done) + u" / " + str(par_form.max_iter) + u"\n" +
-        u"Duration       : " + format_duration(elapsed_sec) + u"\n\n" +
+        u"Duration       : " + format_duration(elapsed_sec) + u"\n" + rs_txt + u"\n" +
         u"\n\n".join(lines),
         u"Iteration Done", MessageBoxButtons.OK,
         MessageBoxIcon.Information if err is None else MessageBoxIcon.Warning)
