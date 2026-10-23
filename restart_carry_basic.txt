@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# Ansys Mechanical - CARRY TESTI (log yok, sonuc tek mesaj kutusunda)
+#
+# Ana aracin kullandigi RestartHelper'in (ayni kod) "carry snippet" mantigini dogrular:
+#   1) step 3'e Rmodif (B degeri) ekler, step 1..4'u cozer, 5'in basinda /EOF ile durdurur
+#   2) 4. step'in sonundan restart ederek analizin sonuna kadar cozer (carry snippet'i ile)
+#   3) ayni analizi sifirdan tam cozer
+#   4) iki sonucun son zamandaki kontak kuvvetini karsilastirir
+# Gerekenler: modelde bir 'Rmodif,cid_N,10,deger' snippet'i (preload aracinda Manual mod),
+#             en az 6 step, en az bir kontak.
+# step sayisina (NumberOfSteps) dokunmaz; bitince her seyi geri alir.
+# =============================================================================
+import clr
+import os
+import re
+import time
+import System
+clr.AddReference("System.Windows.Forms")
+from System.Windows.Forms import MessageBox
+from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
+try:
+    from Ansys.Mechanical.DataModel.Enums import LocationDefinitionMethod
+except:
+    LocationDefinitionMethod = None
+
+SNIP_PREFIX = u"PRELOAD_ITER_STEP"
+TEST        = u"RESTART_BASIC_"
+
+# ===============================================================
+#  RESTART (Ansys restart ile degismeyen on step'leri tekrar cozmemek)
+#  - Restart ayarlari kullanicinin buldugu gibi geri yuklenir (restore)
+#  - Restart noktasindan ONCE uygulanan Rmodif / MP,MU komutlari restart'ta
+#    kaybolur; restart step'inin basinda (carry snippet) yeniden uygulanir
+# ===============================================================
+RS_STATS = {"restart": 0, "scratch": 0, "skipped": 0}
+RS_WARN  = []
+
+def rs_norm(n):
+    return n.replace(" ", "").lower()
+
+def rs_set_enum(obj, prop, candidates):
+    """Enum ozelligini isimle atar; zaten ayni ise dokunmaz."""
+    try:
+        cur = getattr(obj, prop)
+    except Exception:
+        return False
+    for c in candidates:
+        if rs_norm(unicode(str(cur))) == rs_norm(c):
+            return True
+    try:
+        t = cur.GetType()
+        names = list(System.Enum.GetNames(t))
+    except Exception:
+        return False
+    norm = dict([(rs_norm(n), n) for n in names])
+    for c in candidates:
+        if rs_norm(c) in norm:
+            try:
+                setattr(obj, prop, System.Enum.Parse(t, norm[rs_norm(c)]))
+                return True
+            except Exception:
+                return False
+    return False
+
+def rs_step_end_time(settings, step):
+    cur = None
+    try:
+        cur = settings.CurrentStepNumber
+    except Exception:
+        pass
+    settings.CurrentStepNumber = step
+    t = float(settings.StepEndTime.Value)
+    if cur is not None:
+        try:
+            settings.CurrentStepNumber = cur
+        except Exception:
+            pass
+    return t
+
+def rs_snippet_step(ch):
+    try:
+        if "ByNumber" not in str(ch.StepSelectionMode):
+            return None
+    except Exception:
+        return None
+    snum = None
+    try:
+        snum = int(ch.StepNumber)
+    except Exception:
+        pass
+    try:
+        snum = int(ch.InternalObject.StepNumber)
+    except Exception:
+        pass
+    return snum
+
+def rs_parse_solve_out(workdir):
+    info = {"restart_from": None, "elapsed": None, "cp": None}
+    try:
+        f = open(os.path.join(workdir, u"solve.out"), "r")
+        try:
+            lines = f.read().splitlines()
+        finally:
+            f.close()
+    except Exception:
+        return info
+    for l in lines:
+        m = re.search(r"RESTART PREVIOUSLY RUN ANALYSIS FROM LOADSTEP\s+(\d+)", l)
+        if m:
+            info["restart_from"] = int(m.group(1))
+        m = re.search(r"Elapsed Time \(sec\)\s*=\s*([0-9.]+)", l)
+        if m:
+            info["elapsed"] = float(m.group(1))
+        m = re.search(r"CP Time\s+\(sec\)\s*=\s*([0-9.]+)", l)
+        if m:
+            info["cp"] = float(m.group(1))
+    return info
+
+def rs_add_carry(analysis, step, lines):
+    cmd       = analysis.AddCommandSnippet()
+    cmd.Name  = SNIP_PREFIX + u"_CARRY"
+    cmd.Input = u"\n".join([u"! re-apply real constants / friction that a restart does not carry over"] + lines)
+    cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+    cmd.StepNumber        = step
+    return cmd
+
+class RestartHelper(object):
+    """
+        rh = RestartHelper(analysis, workdir);  rh.setup()       # ayarlari kaydet + restart ayarlarini yap
+        rh.scratch();  info = rh.solve()                         # sifirdan (restart noktalari uretilir)
+        if rh.from_end_of_step(k):                               # k. step sonundan restart
+            lines, warn = rh.carry_lines(k)                      # restart'ta kaybolan komutlar
+            carry = rs_add_carry(analysis, k + 1, lines)
+        info = rh.solve()                                        # info["restart_from"] == k ise restart kullanildi
+        rh.restore()                                             # kullanicinin ayarlarini oldugu gibi geri yukle
+    """
+    PROPS = ["GenerateRestartPoints", "SaveAtLoadStep", "SaveAtSubstep", "RetainFilesAfterFullSolve",
+             "CombineRestartFiles", "DeleteUnneededFiles", "RestartType", "CurrentRestartPoint"]
+    RE_RMODIF = re.compile(r"^\s*Rmodif\s*,\s*([^,\s]+)\s*,\s*([^,\s]+)\s*,", re.I)
+    RE_MP     = re.compile(r"^\s*MP\s*,\s*MU\s*,\s*([^,\s]+)\s*,", re.I)
+
+    def __init__(self, analysis, workdir, combine=u"Yes"):
+        self.analysis = analysis
+        self.settings = analysis.AnalysisSettings
+        self.workdir  = workdir
+        self.combine  = combine
+        self.saved    = {}
+
+    def setup(self):
+        s = self.settings
+        for p in RestartHelper.PROPS:
+            try:
+                self.saved[p] = getattr(s, p)
+            except Exception:
+                pass
+        rs_set_enum(s, "GenerateRestartPoints", ["Manual"])
+        rs_set_enum(s, "SaveAtLoadStep", ["All"])
+        rs_set_enum(s, "SaveAtSubstep", ["Last"])
+        rs_set_enum(s, "RetainFilesAfterFullSolve", ["Yes"])
+        rs_set_enum(s, "CombineRestartFiles", [self.combine])
+        try:
+            if getattr(s, "DeleteUnneededFiles") is not False:
+                s.DeleteUnneededFiles = False
+        except Exception:
+            pass
+        rs_set_enum(s, "RestartType", ["Manual"])
+
+    def restore(self):
+        """Kullanicinin restart ayarlarini bulundugu gibi geri yukler."""
+        s = self.settings
+        for p in ["RestartType", "CurrentRestartPoint", "GenerateRestartPoints", "SaveAtLoadStep",
+                  "SaveAtSubstep", "RetainFilesAfterFullSolve", "CombineRestartFiles", "DeleteUnneededFiles"]:
+            if p in self.saved:
+                try:
+                    setattr(s, p, self.saved[p])
+                except Exception:
+                    pass
+
+    def scratch(self):
+        rs_set_enum(self.settings, "RestartType", ["Manual"])
+        try:
+            self.settings.CurrentRestartPoint = 0
+        except Exception:
+            pass
+
+    def find_point(self, loadstep, end_time=None):
+        s = self.settings
+        rs_set_enum(s, "RestartType", ["Manual"])
+        limit = 20
+        try:
+            limit = max(limit, int(s.NumberOfRestartPoints) + 3)
+        except Exception:
+            pass
+        for idx in range(0, limit):
+            try:
+                s.CurrentRestartPoint = idx
+            except Exception:
+                break
+            try:
+                ls = int(s.RestartAtLoadStep)
+                tm = float(s.RestartAtTime)
+            except Exception:
+                continue
+            if ls == loadstep and (end_time is None or abs(tm - end_time) <= 1e-6 * max(1.0, abs(end_time))):
+                return idx
+        return None
+
+    def from_end_of_step(self, k):
+        """k. load step'in sonundaki restart noktasini secer; yoksa sifirdan baslar (False)."""
+        if k is None or k < 1:
+            self.scratch()
+            return False
+        try:
+            et = rs_step_end_time(self.settings, k)
+        except Exception:
+            et = None
+        idx = self.find_point(k, et)
+        if idx is None:
+            self.scratch()
+            return False
+        try:
+            self.settings.CurrentRestartPoint = idx
+        except Exception:
+            self.scratch()
+            return False
+        return True
+
+    def _key(self, line):
+        m = RestartHelper.RE_RMODIF.match(line)
+        if m:
+            return (u"rmodif", m.group(1).lower(), m.group(2))
+        m = RestartHelper.RE_MP.match(line)
+        if m:
+            return (u"mp", m.group(1).lower())
+        return None
+
+    def carry_lines(self, upto):
+        """
+        Step <= upto snippet'lerindeki Rmodif / MP,MU satirlarinin son degerleri.
+        upto+1'deki snippet'lerde zaten tekrar verilenler cikarilir.
+        Donen: (satirlar, uyari_listesi)  - uyari: restart'ta yeniden uygulanmayacak komut iceren snippet adlari
+        """
+        snips = []
+        idx = 0
+        for ch in self.analysis.Children:
+            idx += 1
+            try:
+                if "CommandSnippet" not in ch.GetType().ToString():
+                    continue
+                if ch.Name.startswith(SNIP_PREFIX):
+                    continue
+                st = rs_snippet_step(ch)
+                if st is None:
+                    continue
+                snips.append((st, idx, ch))
+            except Exception:
+                pass
+        snips.sort(key=lambda t: (t[0], t[1]))
+        entries  = {}
+        order    = []
+        explicit = set()
+        warn     = []
+        for (st, i, ch) in snips:
+            try:
+                text = ch.Input
+            except Exception:
+                continue
+            for raw in text.split(u"\n"):
+                line = raw.strip()
+                if not line:
+                    continue
+                key = self._key(line)
+                if st == upto + 1:
+                    if key:
+                        explicit.add(key)
+                    continue
+                if st > upto:
+                    continue
+                if key:
+                    entries[key] = line
+                    if key not in order:
+                        order.append(key)
+                elif not (line.startswith(u"!") or line.upper().startswith(u"/COM")):
+                    if ch.Name not in warn:
+                        warn.append(ch.Name)
+        return [entries[k] for k in order if k not in explicit], warn
+
+    def solve(self):
+        t0 = time.time()
+        err = None
+        try:
+            self.analysis.Solve(True)
+        except Exception as ex:
+            err = unicode(str(ex))
+        wall = time.time() - t0
+        try:
+            p = os.path.join(self.workdir, u"file.abt")
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        info = rs_parse_solve_out(self.workdir) if self.workdir else {"restart_from": None}
+        info["wall"]  = wall
+        info["error"] = err
+        return info
+
+
+def add_snippet(an, name, text, step):
+    c = an.AddCommandSnippet()
+    c.Name = TEST + name
+    c.Input = text
+    c.StepSelectionMode = SequenceSelectionType.ByNumber
+    c.StepNumber = step
+    return c
+
+def find_interference(an):
+    pat = re.compile(r"Rmodif\s*,\s*(cid_\d+)\s*,\s*10\s*,\s*([-+0-9.eE]+)", re.I)
+    for ch in an.Children:
+        try:
+            if "CommandSnippet" not in ch.GetType().ToString() or ch.Name.startswith(TEST) or ch.Name.startswith(SNIP_PREFIX):
+                continue
+            for line in ch.Input.split(u"\n"):
+                mm = pat.search(line)
+                if mm:
+                    return mm.group(1), float(mm.group(2))
+        except:
+            pass
+    return None
+
+def read_force(an, probe, t):
+    try:
+        an.Solution.EvaluateAllResults()
+    except:
+        pass
+    probe.DisplayTime = Quantity(float(t), u"sec")
+    probe.EvaluateAllResults()
+    return abs(float(probe.Total.Value))
+
+def first_contact(model):
+    for grp in model.Connections.Children:
+        for c in grp.Children:
+            if "ContactRegion" in c.GetType().ToString():
+                return c
+    return None
+
+model = ExtAPI.DataModel.Project.Model
+an = None
+for a_ in model.Analyses:
+    if "static" in str(a_.AnalysisType).lower():
+        an = a_
+        break
+
+msg = ""
+if an is None:
+    msg = "Static Structural analysis not found."
+else:
+    st = an.AnalysisSettings
+    wd = unicode(an.WorkingDir)
+    n_steps = int(st.NumberOfSteps)
+    itf = find_interference(an)
+    contact = first_contact(model)
+    if n_steps < 6:
+        msg = "Needs at least 6 steps."
+    elif itf is None:
+        msg = "No 'Rmodif,cid_N,10,value' snippet found (use the preload tool in Manual mode first)."
+    elif contact is None or LocationDefinitionMethod is None:
+        msg = "No contact found."
+    else:
+        cid, x = itf
+        B = x * 1.5
+        rh = RestartHelper(an, wd)
+        temp = []
+        probe = None
+        try:
+            rh.setup()
+            probe = an.Solution.AddForceReaction()
+            probe.Name = TEST + u"PROBE"
+            probe.LocationMethod = LocationDefinitionMethod.ContactRegion
+            probe.ContactRegionSelection = contact
+            t_end = rs_step_end_time(st, n_steps)
+
+            temp.append(add_snippet(an, u"PHYS", u"Rmodif," + cid + u",10," + (u"%.8f" % B), 3))
+            stop = add_snippet(an, u"STOP", u"/EOF", 5)
+            temp.append(stop)
+            rh.scratch()
+            rh.solve()                                   # step 1..4
+
+            stop.Delete()
+            temp.remove(stop)
+            used = rh.from_end_of_step(4)
+            lines, warn = rh.carry_lines(4)
+            carry = rs_add_carry(an, 5, lines) if lines else None
+            if carry is not None:
+                temp.append(carry)
+            info = rh.solve()                            # restart@4 -> analizin sonu
+            F_restart = read_force(an, probe, t_end)
+
+            rh.scratch()
+            if carry is not None:
+                carry.Delete()
+                temp.remove(carry)
+            rh.solve()                                   # sifirdan tam cozum
+            F_scratch = read_force(an, probe, t_end)
+
+            diff = abs(F_restart - F_scratch) / abs(F_scratch) * 100.0
+            msg = ("Restart point at end of step 4 found: %s\n"
+                   "Solver restarted from load step: %s\n"
+                   "Carry lines re-applied at step 5: %d\n"
+                   "Warnings (uncarried commands): %s\n\n"
+                   "Contact force at the last step\n"
+                   "   restart + carry : %.6g\n"
+                   "   full scratch    : %.6g\n"
+                   "   difference      : %.4f %%\n\n%s") % (
+                       str(used), str(info.get("restart_from")), len(lines),
+                       (", ".join(warn) if warn else "none"), F_restart, F_scratch, diff,
+                       "CARRY OK" if diff < 0.01 else "CARRY NOT OK - do not use restart for the final solve yet")
+        except Exception as ex:
+            msg = "Error: " + str(ex)
+        finally:
+            try:
+                if probe is not None:
+                    probe.Delete()
+            except:
+                pass
+            for c in temp:
+                try:
+                    c.Delete()
+                except:
+                    pass
+            try:
+                rh.restore()
+            except:
+                pass
+MessageBox.Show(msg + "\n\n(temporary objects removed, restart settings restored)", "Carry test")
