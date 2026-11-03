@@ -21,6 +21,10 @@ import time
 import re
 import os
 import math
+try:
+    import json
+except Exception:
+    json = None
 
 try:
     from Ansys.Mechanical.DataModel.Enums import LocationDefinitionMethod
@@ -1814,12 +1818,98 @@ class ContactSelectForm(Form):
 
 
 # ---------------------------------------------------------------
+# Kontak bazli onceki secimler (kalici): ayni kontak tekrar secildiginde varsayilan olarak gelir
+# Dosya: %APPDATA%\\PreloadIterTool\\contact_settings.json   (proje klasorune gore ayrilir)
+# ---------------------------------------------------------------
+def prefs_file():
+    try:
+        base = System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData)
+        d = os.path.join(unicode(base), u"PreloadIterTool")
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        return os.path.join(d, u"contact_settings.json")
+    except Exception:
+        return None
+
+def prefs_project_key(analysis):
+    try:
+        return unicode(analysis.WorkingDir).lower()
+    except Exception:
+        return u"default"
+
+def pref_key(contact):
+    return ckey(contact) + u"|" + unicode(contact.Name)
+
+def _read_prefs_file():
+    pth = prefs_file()
+    if json is None or not pth or not os.path.exists(pth):
+        return {}
+    try:
+        f = open(pth, "r")
+        try:
+            return json.load(f)
+        finally:
+            f.close()
+    except Exception:
+        return {}
+
+def load_prefs(pkey):
+    return _read_prefs_file().get(pkey, {})
+
+def find_pref(prefs, contact):
+    """Once tam anahtar (kimlik|isim); bulunamazsa ayni isimli TEK kayit."""
+    if not prefs:
+        return None
+    k = pref_key(contact)
+    if k in prefs:
+        return prefs[k]
+    nm = u"|" + unicode(contact.Name)
+    cands = [v for (kk, v) in prefs.items() if kk.endswith(nm)]
+    if len(cands) == 1:
+        return cands[0]
+    return None
+
+def save_prefs(pkey, items):
+    """Iterasyon bitse de bitmese de (hata/iptal dahil) son secimler ve son interference degeri kaydedilir."""
+    pth = prefs_file()
+    if json is None or not pth:
+        return
+    try:
+        data = _read_prefs_file()
+        proj = data.get(pkey, {})
+        for it in items:
+            try:
+                mode = it.get("tol_mode", u"both")
+                sign = u"-" if mode == u"lower" else (u"+" if mode == u"upper" else u"")
+                x = it.get("x", it.get("x0"))
+                proj[pref_key(it["contact"])] = {
+                    "fkey":   ckey(it["fcontact"]),
+                    "fname":  unicode(it["fcontact"].Name),
+                    "step":   int(it["step"]),
+                    "dir":    unicode(it["dir"]),
+                    "cs":     it.get("cs_name"),
+                    "target": float(it["target"]) / 1000.0,
+                    "tol":    sign + fmt_val(it["tol"]),
+                    "x":      float(x)}
+            except Exception:
+                pass
+        data[pkey] = proj
+        f = open(pth, "w")
+        try:
+            json.dump(data, f)
+        finally:
+            f.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------
 # ADIM 3 (sadece Preload > Iteration): kontak basina ayarlar
 # ---------------------------------------------------------------
 class IterParamForm(Form):
     DIRS = [u"X", u"Y", u"Z", u"Total"]
 
-    def __init__(self, selected, step_count, cs_names, all_contacts):
+    def __init__(self, selected, step_count, cs_names, all_contacts, prefs=None):
         self.Text            = u"Preload Iteration Settings"
         n_rows   = len(selected)
         vis_rows = min(n_rows, 6)
@@ -1884,11 +1974,16 @@ class IterParamForm(Form):
             cb_force.Font          = base_font
             cb_force.Location      = Point(620, y1)
             cb_force.Size          = Size(410, 24)
+            pr = find_pref(prefs, contact)      # bu kontagin onceki secimleri (varsa)
             sel_idx = -1
             for j, (nm, obj) in enumerate(all_contacts):
                 cb_force.Items.Add(nm)
                 if ckey(obj) == ckey(contact):
                     sel_idx = j                 # varsayilan: preload uygulanan kontakla ayni
+            if pr:
+                for j, (nm, obj) in enumerate(all_contacts):
+                    if ckey(obj) == pr.get("fkey"):
+                        sel_idx = j
             cb_force.SelectedIndex = sel_idx
             fit_dropdown(cb_force, base_font)
             rp.Controls.Add(cb_force)
@@ -1903,7 +1998,8 @@ class IterParamForm(Form):
             cb_step.Size     = Size(60, 24)
             for s_ in range(1, step_count + 1):
                 cb_step.Items.Add(str(s_))
-            cb_step.SelectedIndex = -1
+            ps = pr.get("step") if pr else None
+            cb_step.SelectedIndex = (ps - 1) if (ps and 1 <= ps <= step_count) else -1
             fit_dropdown(cb_step, base_font)
             rp.Controls.Add(cb_step)
 
@@ -1915,7 +2011,7 @@ class IterParamForm(Form):
             cb_dir.Size     = Size(74, 24)
             for d in IterParamForm.DIRS:
                 cb_dir.Items.Add(d)
-            cb_dir.SelectedIndex = -1
+            cb_dir.SelectedIndex = IterParamForm.DIRS.index(pr["dir"]) if (pr and pr.get("dir") in IterParamForm.DIRS) else -1
             fit_dropdown(cb_dir, base_font)
             rp.Controls.Add(cb_dir)
 
@@ -1927,27 +2023,27 @@ class IterParamForm(Form):
             cb_cs.Size     = Size(190, 24)
             for n in cs_names:
                 cb_cs.Items.Add(n)
-            cb_cs.SelectedIndex = -1
+            cb_cs.SelectedIndex = cs_names.index(pr["cs"]) if (pr and pr.get("cs") in cs_names) else -1
             fit_dropdown(cb_cs, base_font)
             rp.Controls.Add(cb_cs)
 
             rp.Controls.Add(mk_label(u"Target [kN]:", 588, y2, 76))
             t_target = TextBox()
-            t_target.Text     = u""
+            t_target.Text     = fmt_val(pr["target"]) if (pr and pr.get("target") is not None) else u""
             t_target.Location = Point(666, y2)
             t_target.Size     = Size(72, 24)
             rp.Controls.Add(t_target)
 
             rp.Controls.Add(mk_label(u"Tolerance [%]:", 748, y2, 92))
             t_tol = TextBox()
-            t_tol.Text     = u""
+            t_tol.Text     = unicode(pr["tol"]) if (pr and pr.get("tol")) else u""
             t_tol.Location = Point(842, y2)
             t_tol.Size     = Size(50, 24)
             rp.Controls.Add(t_tol)
 
             rp.Controls.Add(mk_label(u"Initial [mm]:", 902, y2, 76))
             t_x0 = TextBox()
-            t_x0.Text     = u"0.05"
+            t_x0.Text     = fmt_val(pr["x"]) if (pr and pr.get("x") is not None) else u"0.05"
             t_x0.Location = Point(980, y2)
             t_x0.Size     = Size(62, 24)
             rp.Controls.Add(t_x0)
@@ -2190,6 +2286,7 @@ def run_iteration_mode(model, static_analysis, select_form, par_form, start_cid)
 
     if cancelled_by_user[0]:
         prog.Close()
+        save_prefs(prefs_project_key(static_analysis), items)
         MessageBox.Show(u"Operation cancelled by user.", u"Cancelled",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning)
         return
@@ -2210,6 +2307,7 @@ def run_iteration_mode(model, static_analysis, select_form, par_form, start_cid)
         iters_done = 0
         err = u"Unexpected error: " + unicode(str(ex))
 
+    save_prefs(prefs_project_key(static_analysis), items)      # tamamlansa da tamamlanmasa da
     elapsed_sec = int((DateTime.Now - start_time).TotalSeconds)
     prog.Close()
 
@@ -2296,7 +2394,8 @@ else:
                     run_manual(static_analysis, select_form, cmd_type, cmd_value, step_num, start_cid)
                     break
 
-                par_form   = IterParamForm(select_form.selected_contacts, step_count, cs_names, all_contacts)
+                par_form   = IterParamForm(select_form.selected_contacts, step_count, cs_names, all_contacts,
+                                           load_prefs(prefs_project_key(static_analysis)))
                 par_result = par_form.ShowDialog()
                 if par_result == DialogResult.Retry:
                     continue
