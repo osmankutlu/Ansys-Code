@@ -1,0 +1,2572 @@
+# -*- coding: utf-8 -*-
+# preload_command_9  -  Preload (Rmodif interference) komutu ekleme + reaction force iterasyon araci
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (Form, Button, Label, MessageBox, MessageBoxButtons,
+                                  MessageBoxIcon, FormStartPosition, FormBorderStyle,
+                                  DialogResult, GroupBox, FlatStyle, TextBox, TreeView, TreeNode,
+                                  Application, ComboBox, ComboBoxStyle, Panel, CheckBox,
+                                  AnchorStyles, Clipboard, TextDataFormat, TextRenderer,
+                                  ScrollBars, BorderStyle)
+from System.Drawing import (Size, Point, Font, FontStyle, Color, ContentAlignment,
+                            Bitmap, Graphics, Icon, PointF, SolidBrush)
+from System.Drawing.Drawing2D import SmoothingMode, GraphicsPath, FillMode
+from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
+from System import Array, DateTime
+from System.Threading import Thread
+from System.Runtime.InteropServices import Marshal
+import System
+import System.IO
+import time
+import re
+import os
+import math
+try:
+    import json
+except Exception:
+    json = None
+
+try:
+    from Ansys.Mechanical.DataModel.Enums import LocationDefinitionMethod
+except:
+    LocationDefinitionMethod = None
+
+# ---------------------------------------------------------------
+# Tema  (Neuber arayuzuyle ayni: renkler, yazi tipleri, flat butonlar, GroupBox duzeni, durum satiri)
+# ---------------------------------------------------------------
+ACCENT = Color.FromArgb(0, 120, 215)
+MUTED = Color.FromArgb(105, 105, 115)
+DARK = Color.FromArgb(35, 35, 40)
+ERR = Color.FromArgb(200, 40, 40)
+WARN = Color.FromArgb(190, 120, 0)
+OK = Color.FromArgb(30, 140, 60)
+BG = Color.FromArgb(245, 246, 248)
+ROW_A = Color.White
+ROW_B = Color.FromArgb(240, 245, 252)
+ORANGE_ROW = Color.FromArgb(255, 238, 214)     # onceden girilmis degerli satir
+ORANGE_CTRL = Color.FromArgb(255, 222, 186)    # o satirdaki secim kutulari
+F = Font("Segoe UI", 9.0)
+FB = Font("Segoe UI", 9.0, FontStyle.Bold)
+FH = Font("Segoe UI", 11.0, FontStyle.Bold)
+
+PRIMARY_TEXTS = [u"Start", u"Next >", u"Apply", u"Close"]
+
+
+def style_button(b, kind):
+    """kind: primary (mavi dolu) / danger (kirmizi dolu) / secondary (beyaz, mavi yazi)"""
+    b.FlatStyle = FlatStyle.Flat
+    b.Font = FB
+    if kind == u"primary" or kind == u"danger":
+        b.FlatAppearance.BorderSize = 0
+        b.BackColor = ERR if kind == u"danger" else ACCENT
+        b.ForeColor = Color.White
+    else:
+        b.FlatAppearance.BorderSize = 1
+        b.BackColor = Color.White
+        b.ForeColor = ACCENT
+
+
+def apply_theme(root):
+    """Eski formlardaki (ProgressForm, IterParamForm) butonlari Neuber stiline cevirir."""
+    for c in root.Controls:
+        try:
+            if isinstance(c, Button):
+                if c.Text == u"Stop":
+                    style_button(c, u"danger")
+                elif c.Text in PRIMARY_TEXTS:
+                    style_button(c, u"primary")
+                else:
+                    style_button(c, u"secondary")
+            elif isinstance(c, GroupBox) or isinstance(c, Panel):
+                apply_theme(c)
+        except:
+            pass
+
+
+def label(parent, text, x, y, w, h, font=F, color=DARK):
+    l = Label()
+    l.Text = text
+    l.Location = Point(x, y)
+    l.Size = Size(w, h)
+    l.Font = font
+    l.ForeColor = color
+    parent.Controls.Add(l)
+    return l
+
+
+def textbox(parent, x, y, w):
+    t = TextBox()
+    t.Font = F
+    t.Location = Point(x, y)
+    t.Size = Size(w, 24)
+    parent.Controls.Add(t)
+    return t
+
+
+def button(parent, text, x, y, w, primary=False, danger=False):
+    b = Button()
+    b.Text = text
+    style_button(b, u"danger" if danger else (u"primary" if primary else u"secondary"))
+    b.Location = Point(x, y)
+    b.Size = Size(w, 30)
+    parent.Controls.Add(b)
+    return b
+
+
+# ---------------------------------------------------------------
+# Scroll'u devre disi birakan ComboBox
+# ---------------------------------------------------------------
+def make_no_scroll_combo():
+    combo = ComboBox()
+    def on_mouse_wheel(sender, e):
+        try:
+            e.Handled = True
+        except:
+            pass
+    combo.MouseWheel += on_mouse_wheel
+    return combo
+
+
+def combo(parent, x, y, w):
+    c = make_no_scroll_combo()
+    c.DropDownStyle = ComboBoxStyle.DropDownList
+    c.Font = F
+    c.Location = Point(x, y)
+    c.Size = Size(w, 24)
+    parent.Controls.Add(c)
+    return c
+
+
+def make_icon():
+    """32x32 cark ikonu (8 dis, ortasi delik) - Neuber ile ayni."""
+    bmp = Bitmap(32, 32)
+    g = Graphics.FromImage(bmp)
+    g.SmoothingMode = SmoothingMode.AntiAlias
+    g.Clear(Color.Transparent)
+    N, R, r, t1, t2 = 8, 14.0, 10.5, 0.42 * math.pi / 8, 0.62 * math.pi / 8
+    path = GraphicsPath(FillMode.Alternate)
+    pts = []
+    for i in range(N):
+        a = 2 * math.pi * i / N
+        for rad, ang in ((r, a - t2), (R, a - t1), (R, a + t1), (r, a + t2)):
+            pts.append(PointF(16 + rad * math.cos(ang), 16 + rad * math.sin(ang)))
+    path.AddPolygon(Array[PointF](pts))
+    path.AddEllipse(11.5, 11.5, 9.0, 9.0)          # delik
+    g.FillPath(SolidBrush(ACCENT), path)
+    g.Dispose()
+    return Icon.FromHandle(bmp.GetHicon())
+
+
+_ICON = [None]
+
+
+def app_icon():
+    if _ICON[0] is None:
+        try:
+            _ICON[0] = make_icon()
+        except Exception:
+            _ICON[0] = False
+    return _ICON[0] if _ICON[0] else None
+
+
+def ckey(c):
+    """Kontak kimligi (ayni kontagi tekrar saymamak icin)"""
+    try:
+        return u"id" + unicode(str(c.ObjectId))
+    except:
+        return u"nm" + unicode(c.Name)
+
+
+# ---------------------------------------------------------------
+# Acilir liste genisligi
+# ---------------------------------------------------------------
+def fit_dropdown(combo, font, max_items=12):
+    """Acilir liste makul yukseklikte (en cok max_items satir) ve en uzun metne gore genislikte olsun."""
+    try:
+        combo.MaxDropDownItems = max_items
+        combo.IntegralHeight   = True
+        w = combo.Width
+        for itm in combo.Items:
+            tw = TextRenderer.MeasureText(unicode(itm), font).Width + 30
+            if tw > w:
+                w = tw
+        combo.DropDownWidth = min(w, 700)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------
+# Sure formatla
+# ---------------------------------------------------------------
+def format_duration(elapsed_sec):
+    if elapsed_sec < 60:
+        return str(elapsed_sec) + u" sec"
+    else:
+        mins = elapsed_sec // 60
+        secs = elapsed_sec - mins * 60
+        return str(mins) + u" min " + str(secs) + u" sec"
+
+def fmt_val(x):
+    t = (u"%.8f" % x).rstrip(u"0").rstrip(u".")
+    if t == u"" or t == u"-":
+        t = u"0"
+    return t
+
+# ---------------------------------------------------------------
+# Kontak agaci verisi: alt basliklar (ic ice gruplar) korunur
+# Dugum = [isim, [dogrudan kontaklar], [alt gruplar]]
+# ---------------------------------------------------------------
+HIDDEN_SUPPRESSED = [0]
+MAX_DEPTH = 6
+
+
+def get_existing_cid(contact):
+    for child in contact.Children:
+        if "CommandSnippet" not in child.GetType().ToString():
+            continue
+        try:
+            matches = re.findall(r"cid_(\d+)\s*=\s*cid", child.Input)
+            if matches:
+                return int(matches[0])
+        except:
+            pass
+    return None
+
+
+def is_contact(obj):
+    try:
+        return "ContactRegion" in obj.GetType().ToString()
+    except Exception:
+        return False
+
+
+def get_children(obj):
+    try:
+        return list(obj.Children)
+    except Exception:
+        return []
+
+
+def find_max_existing_cid(obj, depth=0):
+    """Tum kontaklardaki (alt basliklar dahil) max cid numarasi."""
+    m = 0
+    for ch in get_children(obj):
+        if is_contact(ch):
+            cid = get_existing_cid(ch)
+            if cid is not None and cid > m:
+                m = cid
+        elif depth < MAX_DEPTH:
+            m = max(m, find_max_existing_cid(ch, depth + 1))
+    return m
+
+
+def is_suppressed(obj):
+    """Agacta 'x' simgesiyle gorunen (suppress edilmis) nesneleri birkac yontemle tespit eder."""
+    try:
+        if bool(obj.Suppressed):
+            return True
+    except Exception:
+        pass
+    try:
+        if "suppress" in str(obj.ObjectState).lower():
+            return True
+    except Exception:
+        pass
+    try:
+        if str(obj.Suppressed).strip().lower() in ("true", "yes", "1"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def collect_contacts(obj, path, depth, sup, found, order):
+    """Alt basliklari gezerek kontaklari toplar. Ayni kontak birden fazla yerde gorunurse
+    (ust klasor tum kontaklari duz listeleyebilir) EN DERIN yol (kendi klasoru) gecerli olur."""
+    for ch in get_children(obj):
+        if is_contact(ch):
+            k = ckey(ch)
+            s = sup or is_suppressed(ch)
+            rec = found.get(k)
+            if rec is None:
+                found[k] = [ch, path, s]
+                order.append(k)
+            elif len(path) > len(rec[1]):
+                rec[1] = path
+                rec[2] = s
+        elif depth < MAX_DEPTH:
+            try:
+                nm = unicode(ch.Name)
+            except Exception:
+                nm = u"?"
+            collect_contacts(ch, path + [nm], depth + 1, sup or is_suppressed(ch), found, order)
+
+
+def parent_path(c, root_key):
+    """Kontagin .Parent zinciri Connections'a ulasiyorsa klasor adlari (ustten alta); aksi halde None."""
+    names = []
+    o = c
+    for i in range(MAX_DEPTH + 2):
+        try:
+            p = o.Parent
+        except Exception:
+            return None
+        if p is None:
+            return None
+        try:
+            pk = ckey(p)
+        except Exception:
+            return None
+        if pk == root_key:
+            names.reverse()
+            return names
+        try:
+            names.append(unicode(p.Name))
+        except Exception:
+            return None
+        o = p
+    return None
+
+
+def prune_groups(g):
+    g[2] = [s for s in g[2] if prune_groups(s)]
+    return bool(g[1] or g[2])
+
+
+def build_contact_tree(connections):
+    """Kok dugum doner: [u"Connections", [kok kontaklar], [gruplar]]; kok dugumun kendisi agacta gosterilmez.
+    Gruplar kontagin gercek klasoruna gore kurulur (Connections > Contacts > klasorler ...).
+    Suppress edilmis kontaklar (ve gruplar) alinmaz."""
+    HIDDEN_SUPPRESSED[0] = 0
+    found = {}
+    order = []
+    collect_contacts(connections, [], 1, False, found, order)
+    try:
+        root_key = ckey(connections)
+    except Exception:
+        root_key = None
+    root = [u"Connections", [], []]
+    for k in order:
+        c, path, sup = found[k]
+        pp = parent_path(c, root_key) if root_key is not None else None
+        if pp is not None and len(pp) > len(path):
+            path = pp
+        if sup:
+            HIDDEN_SUPPRESSED[0] += 1
+            continue
+        node = root
+        for nm in path:
+            nxt = None
+            for sg in node[2]:
+                if sg[0] == nm:
+                    nxt = sg
+                    break
+            if nxt is None:
+                nxt = [nm, [], []]
+                node[2].append(nxt)
+            node = nxt
+        node[1].append(c)
+    prune_groups(root)
+    return root
+
+
+def count_contacts(g):
+    return len(g[1]) + sum(count_contacts(s) for s in g[2])
+
+
+def flatten_contacts(g):
+    out = list(g[1])
+    for s in g[2]:
+        out.extend(flatten_contacts(s))
+    return out
+
+
+# ---------------------------------------------------------------
+# Static Structural analizi bul
+# ---------------------------------------------------------------
+def find_static_structural(model):
+    for analysis in model.Analyses:
+        atype = str(analysis.AnalysisType).lower()
+        if "static" in atype or "staticstructural" in atype:
+            return analysis
+    return None
+
+# ---------------------------------------------------------------
+# Analizdeki step sayisini bul
+# ---------------------------------------------------------------
+def get_step_count(analysis):
+    try:
+        return int(analysis.AnalysisSettings.NumberOfSteps)
+    except:
+        pass
+    try:
+        return int(analysis.AnalysisSettings.InternalObject.NumberOfSteps)
+    except:
+        pass
+    return 1
+
+# ---------------------------------------------------------------
+# Koordinat sistemi listesi (Global dahil)
+# ---------------------------------------------------------------
+def get_cs_list(model):
+    out = []
+    try:
+        for cs in model.CoordinateSystems.Children:
+            if "CoordinateSystem" in cs.GetType().ToString():
+                out.append((cs.Name, cs))
+    except:
+        pass
+    return out
+
+# ---------------------------------------------------------------
+# Preload komutu:  Rmodif,cid_N,10,deger   (interference)
+# ---------------------------------------------------------------
+def make_cmd_line(cid_n, cmd_value):
+    return u"Rmodif,cid_" + str(cid_n) + u",10," + cmd_value
+
+
+def cmd_line_key(cid_n):
+    # Belirli bir cid satirini tanimak icin (cid_1 ile cid_10 karismasin diye sondaki virgul var)
+    return (u"Rmodif,cid_" + str(cid_n) + u",10,").upper()
+
+
+# ---------------------------------------------------------------
+# Mevcut ayni step'teki preload command'i bul
+# ---------------------------------------------------------------
+def find_existing_solution_cmd(analysis, step_num):
+    prefix = u"Rmodif,"
+    for child in analysis.Children:
+        if "CommandSnippet" not in child.GetType().ToString():
+            continue
+        try:
+            if child.Name.startswith(u"PRELOAD_ITER_STEP"):
+                continue
+        except:
+            pass
+        try:
+            snum = None
+            try:
+                snum = int(child.StepNumber)
+            except:
+                pass
+            try:
+                snum = int(child.InternalObject.StepNumber)
+            except:
+                pass
+            if snum != step_num:
+                continue
+            if prefix.upper() in child.Input.upper():
+                return child
+        except:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------
+# Mevcut command'e ekle veya yeni olustur
+# ---------------------------------------------------------------
+def add_or_update_solution_cmd(analysis, cmd_value, cid_list, step_num):
+    existing  = find_existing_solution_cmd(analysis, step_num)
+    new_lines = [make_cmd_line(cid_n, cmd_value) for cid_n in cid_list]
+
+    if existing is not None:
+        current_lines = [l for l in existing.Input.split(u"\n") if l.strip()]
+        for line in new_lines:
+            if line not in current_lines:
+                current_lines.append(line)
+        existing.Input = u"\n".join(current_lines)
+        return existing, False
+    else:
+        cmd       = analysis.AddCommandSnippet()
+        cmd.Name  = u"APDL_INTERFERENCE_STEP" + str(step_num)
+        cmd.Input = u"\n".join(new_lines)
+        cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+        cmd.StepNumber        = step_num
+        return cmd, True
+
+
+# ---------------------------------------------------------------
+# Iterasyon icin: belirli cid satirinin DEGERINI degistir
+# (satir varsa yerinde guncelle, yoksa ekle, command yoksa olustur)
+# ---------------------------------------------------------------
+def set_cmd_value(analysis, step_num, cid_n, value_str):
+    existing = find_existing_solution_cmd(analysis, step_num)
+    if existing is None:
+        add_or_update_solution_cmd(analysis, value_str, [cid_n], step_num)
+        return
+    key       = cmd_line_key(cid_n)
+    new_line  = make_cmd_line(cid_n, value_str)
+    lines     = [l.strip() for l in existing.Input.split(u"\n") if l.strip()]
+    found     = False
+    for i in range(len(lines)):
+        if lines[i].upper().startswith(key):
+            lines[i] = new_line
+            found = True
+    if not found:
+        lines.append(new_line)
+    existing.Input = u"\n".join(lines)
+
+
+# ---------------------------------------------------------------
+# CID atama (hem manuel hem iterasyon modu kullanir)
+# ---------------------------------------------------------------
+def assign_cids(selected, start_cid, prog, cancelled):
+    next_cid = start_cid
+    cid_list = []
+    reused   = 0
+    created  = 0
+    total    = len(selected)
+    for idx, (contact, existing_cid) in enumerate(selected):
+        if cancelled[0]:
+            break
+        prog.update(u"Adding CID commands...  (" + str(idx + 1) + u"/" + str(total) + u")",
+                    contact.Name)
+        if existing_cid is not None:
+            cid_list.append(existing_cid)
+            reused += 1
+        else:
+            next_cid += 1
+            cid_list.append(next_cid)
+            cmd_c       = contact.AddCommandSnippet()
+            cmd_c.Name  = u"Contact_Command_" + str(next_cid)
+            cmd_c.Input = u"cid_" + str(next_cid) + u" = cid"
+            created += 1
+    return cid_list, next_cid, reused, created
+
+# ---------------------------------------------------------------
+# Progress formu
+# ---------------------------------------------------------------
+class ProgressForm(Form):
+    def __init__(self):
+        self.Text            = u"Processing..."
+        self.ClientSize      = Size(420, 110)
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedSingle
+        self.MaximizeBox     = False
+        self.MinimizeBox     = True
+        self.TopMost         = True
+        self.BackColor       = BG
+        self.Font            = F
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+
+        base_font  = F
+        font_bold  = Font(base_font, FontStyle.Bold)
+
+        self.lbl_status = Label()
+        self.lbl_status.Text     = u"Starting..."
+        self.lbl_status.Font     = font_bold
+        self.lbl_status.Location = Point(14, 14)
+        self.lbl_status.Size     = Size(300, 20)
+        self.Controls.Add(self.lbl_status)
+
+        self.lbl_detail = Label()
+        self.lbl_detail.Text      = u""
+        self.lbl_detail.Font      = base_font
+        self.lbl_detail.ForeColor = MUTED
+        self.lbl_detail.Location  = Point(14, 38)
+        self.lbl_detail.Size      = Size(390, 40)
+        self.Controls.Add(self.lbl_detail)
+
+        btn_stop = Button()
+        btn_stop.Text      = u"Stop"
+        btn_stop.Font      = font_bold
+        btn_stop.ForeColor = Color.White
+        btn_stop.BackColor = ERR
+        btn_stop.FlatStyle = FlatStyle.Standard
+        btn_stop.Location  = Point(314, 10)
+        btn_stop.Size      = Size(90, 32)
+        btn_stop.Click    += self._on_stop
+        self.Controls.Add(btn_stop)
+
+        self.FormClosing += self._on_closing
+        apply_theme(self)
+
+    def _on_stop(self, sender, e):
+        self._cancelled[0] = True
+        self.lbl_status.Text     = u"Stopping..."
+        self.lbl_detail.Text     = u"Aborting the running solve..."
+        Application.DoEvents()
+
+    def _on_closing(self, sender, e):
+        if not self._cancelled[0]:
+            self._cancelled[0] = True
+
+    def show_with(self, cancelled_ref):
+        self._cancelled = cancelled_ref
+        self.Show()
+        Application.DoEvents()
+
+    def update(self, status, detail=u""):
+        self.lbl_status.Text  = status
+        self.lbl_detail.Text  = detail
+        Application.DoEvents()
+
+    # Kontak basligi + altinda deneme sonuclari
+    def enable_log(self, titles):
+        self.FormBorderStyle = FormBorderStyle.Sizable      # genisletilebilir
+        self.MaximizeBox     = True
+        self.ClientSize      = Size(800, 470)                # 640 -> 800 (%25 daha genis)
+        self.MinimumSize     = Size(560, 320)
+        self.lbl_status.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        self.lbl_detail.Size   = Size(660, 20)
+        self.lbl_detail.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        for c in self.Controls:
+            if isinstance(c, Button):
+                c.Location = Point(696, 10)
+                c.Anchor   = AnchorStyles.Top | AnchorStyles.Right
+        self.tv_log = TreeView()
+        self.tv_log.Location      = Point(14, 70)
+        self.tv_log.Size          = Size(772, 386)
+        self.tv_log.Anchor        = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        self.tv_log.Font          = Font("Segoe UI", 9.5, FontStyle.Regular)
+        self.tv_log.ItemHeight    = 22
+        self.tv_log.ShowLines     = True
+        self.tv_log.ShowPlusMinus = True
+        self.tv_log.ShowRootLines = True
+        self.Controls.Add(self.tv_log)
+        self._log_nodes = []
+        self._pending = {}
+        for t in titles:
+            n = TreeNode(t)
+            n.ForeColor = ACCENT
+            self.tv_log.Nodes.Add(n)
+            n.Expand()
+            self._log_nodes.append(n)
+        self.CenterToScreen()
+        Application.DoEvents()
+
+    # Deneme basladiginda satir hemen yazilir (interference degeri), cozum bitince force eklenir
+    def begin_trial(self, i, text):
+        try:
+            n  = self._log_nodes[i]
+            ch = n.Nodes.Add(text)
+            ch.ForeColor = MUTED
+            self._pending[i] = ch
+            n.Expand()
+            ch.EnsureVisible()
+        except:
+            pass
+        Application.DoEvents()
+
+    def close_pending(self, text):
+        # iptal / hata durumunda yarim kalan denemeleri isaretle
+        for i in list(self._pending.keys()):
+            try:
+                self._pending[i].Text = self._pending[i].Text + text
+            except:
+                pass
+        self._pending = {}
+
+    def log_trial(self, i, text, ok=None):
+        try:
+            n = self._log_nodes[i]
+            if i in self._pending:
+                ch = self._pending.pop(i)
+                ch.Text = text
+            else:
+                ch = n.Nodes.Add(text)
+            ch.ForeColor = OK if ok is True else DARK
+            n.ForeColor = OK if ok is True else ACCENT   # kontak basligi: tuttu -> yesil
+            n.Expand()
+            ch.EnsureVisible()
+        except:
+            pass
+        Application.DoEvents()
+
+
+# ===============================================================
+#  ITERASYON MOTORU
+# ===============================================================
+def make_time(t):
+    try:
+        return Quantity(float(t), u"sec")
+    except:
+        return Quantity(str(t) + u" [sec]")
+
+# Step bitis zamanlarini oku (sadece okuma; NumberOfSteps'e dokunulmaz)
+def get_step_end_times(settings, steps):
+    cur = None
+    try:
+        cur = settings.CurrentStepNumber
+    except:
+        pass
+    out = {}
+    for s in steps:
+        settings.CurrentStepNumber = s
+        out[s] = float(settings.StepEndTime.Value)
+    if cur is not None:
+        try:
+            settings.CurrentStepNumber = cur
+        except:
+            pass
+    return out
+
+def get_workdir(analysis):
+    try:
+        return unicode(analysis.WorkingDir)
+    except:
+        return None
+
+# ---------------------------------------------------------------
+# APDL ile okuma + abort (kesme modu)
+# ---------------------------------------------------------------
+SNIP_PREFIX = u"PRELOAD_ITER_STEP"
+
+def build_abort_block():
+    # /EOF: giris dosyasini burada bitirir; kontrol step'inden sonrasi cozulmez 
+    return [u"! --- preload iteration: stop the solver here", u"/EOF"]
+
+def remove_stale_snippets(analysis):
+    for ch in list(analysis.Children):
+        try:
+            if ch.Name.startswith(SNIP_PREFIX):
+                ch.Delete()
+        except:
+            pass
+
+def add_read_snippets(analysis, items, ctrl_max):
+    # Kontrol step'inden sonraki step'in basinda cozucuyu durdur (abort dosyasi)
+    cmd       = analysis.AddCommandSnippet()
+    cmd.Name  = SNIP_PREFIX + str(ctrl_max + 1)
+    cmd.Input = u"\n".join(build_abort_block())
+    cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+    cmd.StepNumber        = ctrl_max + 1
+    return [cmd]
+
+def delete_snippets(snips):
+    for c in snips:
+        try:
+            c.Delete()
+        except:
+            pass
+
+def clean_iter_files(workdir, items):
+    if workdir is None:
+        return
+    try:
+        p = os.path.join(workdir, u"file.abt")
+        if os.path.exists(p):
+            os.remove(p)
+    except:
+        pass
+
+
+def trial_rows(it):
+    """Excel tablosu satirlari: baslik + her deneme icin bir satir. (satirlar, ok listesi)"""
+    rows = [[u"SUMMARY", u"Interference [mm]", u"Step", u"Applied Contact", u"Read Contact",
+             u"Value [kN]", u"Tolerance", u"Situation"]]
+    oks = []
+    for n, (x, F) in enumerate(it["hist"]):
+        ok = tol_ok(it, F)
+        oks.append(ok)
+        rows.append([u"Trial " + str(n + 1), round(x, 6), it["step"], it["contact"].Name, it["fcontact"].Name,
+                     round(F / 1000.0, 3), tol_cell(it), u"OK" if ok else u"Not OK"])
+    return rows, oks
+
+def html_esc(t):
+    return unicode(t).replace(u"&", u"&amp;").replace(u"<", u"&lt;").replace(u">", u"&gt;")
+
+def rows_to_html(rows, oks):
+    """Excel kullanilamazsa ayni gorunumde basit HTML tablo."""
+    h = [u"<table style='border-collapse:collapse;font-family:Calibri,Arial;font-size:11pt'>"]
+    for r, row in enumerate(rows):
+        if r == 0:
+            bg, wt = u"#D9D9D9", u"bold"
+        elif oks[r - 1]:
+            bg, wt = u"#A9D08E", u"normal"
+        else:
+            bg, wt = u"#FFFFFF", u"normal"
+        h.append(u"<tr>")
+        for v in row:
+            h.append(u"<td style='border:1px solid #808080;padding:2px 8px;background-color:" + bg +
+                     u";font-weight:" + wt + u"'>" + html_esc(v) + u"</td>")
+        h.append(u"</tr>")
+    h.append(u"</table>")
+    return u"".join(h)
+
+def read_clipboard_html():
+    for i in range(15):
+        try:
+            if Clipboard.ContainsText(TextDataFormat.Html):
+                return Clipboard.GetText(TextDataFormat.Html)
+        except Exception:
+            pass
+        Application.DoEvents()
+        Thread.Sleep(100)
+    return None
+
+def inline_excel_html(html):
+    """Excel'in panodaki HTML'inden tabloyu alir; <style> sinif tanimlarini satir ici stile cevirir."""
+    m = re.search(r"<!--StartFragment-->(.*?)<!--EndFragment-->", html, re.S)
+    if m:
+        frag = m.group(1)
+    else:
+        i = html.lower().index("<table")
+        frag = html[i:]
+    rules = {}
+    for sm in re.finditer(r"<style[^>]*>(.*?)</style>", html, re.S | re.I):
+        for mm in re.finditer(r"\.([A-Za-z0-9_]+)\s*\{([^}]*)\}", sm.group(1)):
+            decls = [d.strip() for d in mm.group(2).split(u";") if d.strip() and not d.strip().lower().startswith(u"mso-")]
+            rules[mm.group(1)] = u";".join(decls)
+    def fix_tag(mt):
+        tag = mt.group(0)
+        cm = re.search(r"class=['\"]?([A-Za-z0-9_]+)['\"]?", tag)
+        if not cm:
+            return tag
+        decl = rules.get(cm.group(1), u"")
+        tag = tag.replace(cm.group(0), u"", 1)
+        sm2 = re.search(r"style=(['\"])(.*?)\1", tag, re.S)
+        if sm2:
+            q = sm2.group(1)
+            tag = tag.replace(sm2.group(0), u"style=" + q + decl + u";" + sm2.group(2) + q, 1)
+        else:
+            tag = tag[:-1] + u" style='" + decl + u"'>"
+        return tag
+    frag = re.sub(r"<(?:td|th|tr|table)\b[^>]*>", fix_tag, frag, flags=re.I)
+    frag = re.sub(r"<!\[[^>]*\]>", u"", frag)
+    if u"<table" not in frag.lower():
+        raise Exception(u"no table in clipboard html")
+    return frag
+
+def excel_tables(items):
+    """
+    Her kontak icin Excel'de tablo olusturur, kopyalar ve panodaki HTML'i alir.
+    Excel dosyasi hic kaydedilmez; is bitince kapatilir (silinecek dosya kalmaz). {item idx: html}
+    """
+    t = System.Type.GetTypeFromProgID("Excel.Application")
+    if t is None:
+        raise Exception(u"Excel is not installed")
+    xl = System.Activator.CreateInstance(t)
+    wb = None
+    out = {}
+    try:
+        xl.Visible = False
+        xl.DisplayAlerts = False
+        wb = xl.Workbooks.Add()
+        ws = wb.Worksheets[1]
+        for it in items:
+            if not it["hist"]:
+                continue
+            rows, oks = trial_rows(it)
+            ws.Cells.Clear()
+            for r, row in enumerate(rows):
+                for c, v in enumerate(row):
+                    ws.Cells[r + 1, c + 1].Value2 = v
+            n = len(rows)
+            ws.Range("A1:H" + str(n)).Borders.LineStyle = 1
+            ws.Range("A1:H1").Font.Bold = True
+            ws.Range("A1:H1").Interior.Color = 14277081
+            for r, ok in enumerate(oks):
+                if ok:
+                    ws.Range("A" + str(r + 2) + ":H" + str(r + 2)).Interior.Color = 9359529
+            ws.Columns("A:H").AutoFit()
+            ws.Range("A1:H" + str(n)).Copy()
+            html = read_clipboard_html()
+            if html:
+                try:
+                    out[it["idx"]] = inline_excel_html(html)
+                except Exception:
+                    pass
+    finally:
+        try:
+            xl.CutCopyMode = False
+        except Exception:
+            pass
+        try:
+            if wb is not None:
+                wb.Close(False)
+        except Exception:
+            pass
+        try:
+            xl.Quit()
+        except Exception:
+            pass
+        for o in (wb, xl):
+            try:
+                if o is not None:
+                    Marshal.ReleaseComObject(o)
+            except Exception:
+                pass
+        try:
+            Clipboard.Clear()
+        except Exception:
+            pass
+    return out
+
+def build_comment_tables(items):
+    res = {}
+    try:
+        res = excel_tables(items)
+    except Exception:
+        res = {}
+    for it in items:
+        if it["hist"] and it["idx"] not in res:
+            rows, oks = trial_rows(it)
+            res[it["idx"]] = rows_to_html(rows, oks)
+    return res
+
+def add_probe_comment(it, iters, html=None):
+    cm = it["probe"].AddComment()
+    if html:
+        try:
+            cm.Text = html
+            return
+        except Exception:
+            pass
+    rows, oks = trial_rows(it)
+    lines = []
+    for r in rows[1:]:
+        lines.append(u"  ".join([unicode(v) for v in r]))
+    try:
+        cm.Text = u"\n".join(lines)
+    except Exception:
+        pass
+
+def is_force_probe(obj):
+    try:
+        return "ForceReaction" in obj.GetType().ToString()
+    except:
+        return False
+
+def create_probe(solution, name, contact, cs_obj):
+    """Ayni adli probe daha once olusturulmussa YENISI ACILMAZ: mevcut probe kullanilir, ayarlari guncellenir
+    ve altindaki eski comment'ler silinir (yeni comment iterasyon bitince yazilir). Boylece eski bir
+    sonucun altinda yanlis bir comment kalmaz."""
+    fr = None
+    for ch in list(solution.Children):
+        try:
+            if ch.Name != name:
+                continue
+            if fr is None and is_force_probe(ch):
+                fr = ch
+            elif not is_force_probe(ch):
+                ch.Delete()
+        except:
+            pass
+    if fr is not None:
+        for cm in list(fr.Children):
+            try:
+                if "Comment" in cm.GetType().ToString():
+                    cm.Delete()
+            except:
+                pass
+    else:
+        fr = solution.AddForceReaction()
+        fr.Name = name
+    fr.LocationMethod = LocationDefinitionMethod.ContactRegion
+    fr.ContactRegionSelection = contact
+    if cs_obj is not None:
+        try:
+            fr.Orientation = cs_obj
+        except:
+            pass
+    return fr
+
+def read_probe_value(fr, t, dir_code):
+    try:
+        fr.DisplayTime = make_time(t)
+        fr.EvaluateAllResults()      # zaman degistikten sonra tekrar evaluate gerekir
+    except:
+        pass
+    if dir_code == u"Total":
+        q = fr.Total
+    elif dir_code[0] == u"X":
+        q = fr.XAxis
+    elif dir_code[0] == u"Y":
+        q = fr.YAxis
+    else:
+        q = fr.ZAxis
+    return abs(float(q.Value))
+
+def solve_ok(analysis):
+    try:
+        st = str(analysis.Solution.Status).lower()
+        return ("done" in st)
+    except:
+        return True
+
+def within_tol(F, target, tol_pct, mode=u"both"):
+    """mode: both = +/-tol ; lower = [hedef*(1-tol), hedef] ; upper = [hedef, hedef*(1+tol)]"""
+    d    = F - target
+    band = abs(target) * tol_pct / 100.0
+    eps  = 1e-9 * max(abs(target), 1.0)
+    if mode == u"lower":
+        return (-band - eps) <= d <= eps
+    if mode == u"upper":
+        return -eps <= d <= (band + eps)
+    return abs(d) <= band + eps
+
+def tol_ok(it, F):
+    return within_tol(F, it["target"], it["tol"], it.get("tol_mode", u"both"))
+
+def tol_text(it):
+    m = it.get("tol_mode", u"both")
+    if m == u"lower":
+        return u"-" + fmt_val(it["tol"]) + u"%"
+    if m == u"upper":
+        return u"+" + fmt_val(it["tol"]) + u"%"
+    return u"+/-" + fmt_val(it["tol"]) + u"%"
+
+def tol_cell(it):
+    m = it.get("tol_mode", u"both")
+    if m == u"lower":
+        return u"-" + fmt_val(it["tol"]) + u"%"
+    if m == u"upper":
+        return u"+" + fmt_val(it["tol"]) + u"%"
+    return fmt_val(it["tol"]) + u"%"
+
+def aim_force(it):
+    """Iterasyonun hedefledigi kuvvet: tek tarafli toleransta kabul bandinin ortasi."""
+    m = it.get("tol_mode", u"both")
+    if m == u"lower":
+        return it["target"] * (1.0 - it["tol"] / 200.0)
+    if m == u"upper":
+        return it["target"] * (1.0 + it["tol"] / 200.0)
+    return it["target"]
+
+def next_value(hist, target):
+    # hist: [(x, F), ...]   son nokta = hist[-1]
+    x1, f1 = hist[-1]
+    prev = None
+    for k in range(len(hist) - 2, -1, -1):
+        if abs(hist[k][0] - x1) > 1e-12 * max(1.0, abs(x1)):
+            prev = hist[k]
+            break
+    xn = None
+    if prev is not None and abs(f1 - prev[1]) > 1e-12:
+        # sekant: interpolasyon / ekstrapolasyon
+        xn = x1 + (target - f1) * (x1 - prev[0]) / (f1 - prev[1])
+    else:
+        # oran-oranti
+        if abs(f1) < 1e-9:
+            xn = x1 * 2.0
+        else:
+            xn = x1 * target / f1
+    if xn <= 0:
+        xn = x1 * 0.5
+    if xn > 5.0 * x1:
+        xn = 5.0 * x1
+    if xn < 0.1 * x1:
+        xn = 0.1 * x1
+    return xn
+
+# ===============================================================
+#  Cozum yardimcilari: kesilebilir (asenkron) cozum + dogrulama
+#  (Her iterasyon analizi bastan cozer)
+# ===============================================================
+RS_WARN = []
+FINAL_STATE = {"valid": False, "state": u""}
+
+def rs_is_solving(analysis):
+    for obj in (analysis.Solution, analysis):
+        try:
+            if "solving" in str(obj.ObjectState).lower():
+                return True
+        except Exception:
+            pass
+    try:
+        if "solving" in str(analysis.Solution.Status).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+def rs_state_readable(analysis):
+    try:
+        str(analysis.Solution.ObjectState)
+        return True
+    except Exception:
+        return False
+
+def rs_abort_dirs(workdir):
+    dirs = []
+    if workdir:
+        dirs.append(workdir)
+        # solve.out basligindaki scratch klasoru (varsa) - dosyalar orada okunur
+        try:
+            f = open(os.path.join(workdir, u"solve.out"), "r")
+            try:
+                n = 0
+                for line in f:
+                    n += 1
+                    if n > 600:
+                        break
+                    if "_WB_PROJECTSCRATCH_DIR" in line:
+                        m = re.search(r"=\s*['\"]?([^'\"\r\n]+)", line)
+                        if m:
+                            d = m.group(1).strip()
+                            if os.path.isdir(d) and d not in dirs:
+                                dirs.append(d)
+                        break
+            finally:
+                f.close()
+        except Exception:
+            pass
+    return dirs
+
+def rs_send_abort(workdir):
+    for d in rs_abort_dirs(workdir):
+        try:
+            f = open(os.path.join(d, u"file.abt"), "w")
+            f.write("nonlinear\n")
+            f.close()
+        except Exception:
+            pass
+
+def rs_clear_abort(workdir):
+    for d in rs_abort_dirs(workdir):
+        try:
+            pth = os.path.join(d, u"file.abt")
+            if os.path.exists(pth):
+                os.remove(pth)
+        except Exception:
+            pass
+
+ASYNC_SOLVE = [True]      # asenkron cozum sorun cikarirsa otomatik False olur (bekleyen Solve(True)'ya doner)
+
+def rs_out_path(workdir):
+    return os.path.join(workdir, u"solve.out") if workdir else None
+
+def rs_mtime(pth):
+    try:
+        if pth and os.path.exists(pth):
+            return os.path.getmtime(pth)
+    except Exception:
+        pass
+    return 0.0
+
+def rs_out_finished(pth, m0):
+    """solve.out m0'dan sonra guncellenmis ve bitis ozeti ('Elapsed Time (sec)') iceriyor mu?"""
+    try:
+        if rs_mtime(pth) <= m0:
+            return False
+        f = open(pth, "rb")
+        try:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8000))
+            tail = f.read()
+        finally:
+            f.close()
+        return "Elapsed Time (sec)" in tail
+    except Exception:
+        return False
+
+def rs_solver_errors(workdir):
+    """solve.out'taki ilk hata satirlari (varsa) - hata mesajina eklenir."""
+    pth = rs_out_path(workdir)
+    if not pth:
+        return u""
+    try:
+        f = open(pth, "r")
+        try:
+            lines = f.read().splitlines()
+        finally:
+            f.close()
+    except Exception:
+        return u""
+    hits = [l.strip() for l in lines if ("*** ERROR ***" in l or "FATAL" in l.upper())]
+    if not hits:
+        return u""
+    return u"  |  solver output: " + u" / ".join([unicode(h, "latin-1") for h in hits[:3]])
+
+def solve_blocking(analysis):
+    try:
+        analysis.Solve(True)
+        return None
+    except Exception as ex:
+        return unicode(str(ex))
+
+def solve_interruptible(analysis, cancelled, workdir):
+    """
+    Cozumu ASENKRON baslatir (Solve(False)) ve beklerken arayuzu isler; boylece Stop
+    cozum sirasinda da calisir: Stop'a basilirsa solver'a abort dosyasi (file.abt) yazilir.
+    Bitis, SOLVE.OUT'un guncellenip bitis ozetini icermesi ile dogrulanir (durum bilgisi tek basina yetmez).
+    Asenkron cozum calismazsa otomatik olarak bekleyen Solve(True)'ya doner.
+    Cozucu hic calismadiysa HATA doner (sessizce 0 kuvvet okunmaz).
+    Donen: (hata metni veya None, iptal edildi mi)
+    """
+    pth = rs_out_path(workdir)
+    m0  = rs_mtime(pth)
+    if (not ASYNC_SOLVE[0]) or (not rs_state_readable(analysis)) or pth is None:
+        err = solve_blocking(analysis)
+        if err is None and pth is not None and rs_mtime(pth) <= m0:
+            err = u"The solver did not run (solve.out was not updated)."
+        return err, False
+    t0 = time.time()
+    try:
+        analysis.Solve(False)
+    except Exception as ex:
+        ASYNC_SOLVE[0] = False
+        if u"async" not in RS_WARN:
+            RS_WARN.append(u"async solve unavailable (" + unicode(str(ex))[:80] + u"): Stop works only between solves")
+        err = solve_blocking(analysis)
+        if err is None and rs_mtime(pth) <= m0:
+            err = u"The solver did not run (solve.out was not updated)."
+        return err, False
+    seen_busy  = False
+    abort_sent = False
+    abort_t    = 0.0
+    idle_since = None
+    while True:
+        Application.DoEvents()
+        Thread.Sleep(200)
+        busy = rs_is_solving(analysis)
+        now  = time.time()
+        if busy:
+            seen_busy  = True
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        if cancelled[0] and not abort_sent:
+            rs_send_abort(workdir)
+            abort_sent = True
+            abort_t = now
+        fin = rs_out_finished(pth, m0)
+        if (not busy) and fin:
+            break
+        # solve.out guncellenmiyorsa (cozucu baska klasorde calisiyor olabilir) durum bilgisine guven
+        if (not busy) and seen_busy and idle_since is not None and (now - idle_since > 30) and rs_mtime(pth) <= m0:
+            break
+        if (not busy) and seen_busy and idle_since is not None and (now - idle_since > 30) and (now - rs_mtime(pth) > 30):
+            break
+        if (not seen_busy) and (not fin) and (now - t0 > 120):
+            if abort_sent:
+                break
+            return u"Could not detect that the solver started (the solution never reported 'Solving').", False
+        if abort_sent and (now - abort_t > 120):
+            break
+    if abort_sent:
+        rs_clear_abort(workdir)
+    if cancelled[0]:
+        return None, True
+    if rs_mtime(pth) <= m0:
+        return u"The solver did not run (solve.out was not updated).", False
+    return None, False
+
+def probe_value(fr, dir_code):
+    """Evaluate ETMEZ; sadece degeri okur."""
+    if dir_code == u"Total":
+        q = fr.Total
+    elif dir_code[0] == u"X":
+        q = fr.XAxis
+    elif dir_code[0] == u"Y":
+        q = fr.YAxis
+    else:
+        q = fr.ZAxis
+    return abs(float(q.Value))
+
+def read_probes_once(solution, its):
+    """
+    Tum probe'larin DisplayTime'ini kendi step sonuna ayarlar, SONRA TEK BIR
+    Solution.EvaluateAllResults() cagirir ve degerleri okur. {item idx: |kuvvet|}
+    """
+    for it in its:
+        try:
+            it["probe"].DisplayTime = make_time(it["end_time"])
+        except Exception:
+            pass
+    try:
+        solution.EvaluateAllResults()
+    except Exception:
+        pass
+    out = {}
+    for it in its:
+        try:
+            out[it["idx"]] = probe_value(it["probe"], it["dir"])
+        except Exception:
+            # sadece bu probe okunamadiysa onu ayrica evaluate et
+            try:
+                it["probe"].EvaluateAllResults()
+            except Exception:
+                pass
+            out[it["idx"]] = probe_value(it["probe"], it["dir"])
+    return out
+
+def clear_generated(analysis):
+    """Her cozumden once uretilmis veriyi temizler: analiz her seferinde bastan cozulur."""
+    for obj in (analysis.Solution, analysis):
+        try:
+            obj.ClearGeneratedData()
+            return True
+        except Exception:
+            pass
+    if u"ClearGeneratedData was not available" not in RS_WARN:
+        RS_WARN.append(u"ClearGeneratedData was not available")
+    return False
+
+def run_iteration(analysis, items, max_iter, use_cut, final_solve, prog, cancelled):
+    """Her iterasyon analizi BASTAN cozer. Analiz ayarlarina (restart dahil) hic dokunulmaz."""
+    del RS_WARN[:]
+    FINAL_STATE["valid"] = False
+    FINAL_STATE["state"] = u""
+    try:
+        return _run_iteration_core(analysis, items, max_iter, use_cut, final_solve, prog, cancelled)
+    finally:
+        try:
+            remove_stale_snippets(analysis)
+        except Exception:
+            pass
+        # tum sonuclari evaluate et (tam cozum gecerliyse)
+        if FINAL_STATE["valid"]:
+            try:
+                analysis.Solution.EvaluateAllResults()
+            except Exception:
+                pass
+            try:
+                FINAL_STATE["state"] = (unicode(str(analysis.Solution.ObjectState)) + u" / " +
+                                        unicode(str(analysis.Solution.Status)))
+            except Exception:
+                pass
+
+def _run_iteration_core(analysis, items, max_iter, use_cut, final_solve, prog, cancelled):
+    """
+    ASAMALI iterasyon: preload'lar step sirasina gore cozulur. Once en kucuk step'teki satirlar
+    (kendi icinde birlikte) tutturulur, sonra bir sonraki step'e gecilir:  2 -> 3 -> 4 ...
+    Her asamada cozum o step'te durdurulur (/EOF) ve her iterasyon analizi bastan cozer.
+    """
+    settings    = analysis.AnalysisSettings
+    solution    = analysis.Solution
+    total_steps = get_step_count(analysis)
+    steps       = sorted(set([it["step"] for it in items]))
+    ctrl_max    = steps[-1]
+    last_cut    = bool(use_cut and ctrl_max < total_steps)
+    err         = None
+    workdir     = get_workdir(analysis)
+
+    if use_cut and workdir is None and steps[0] < total_steps:
+        return 0, u"Solver working directory could not be determined (analysis.WorkingDir)."
+
+    remove_stale_snippets(analysis)
+
+    prog.update(u"Preparing...", u"")
+    end_times  = get_step_end_times(settings, steps)
+    used_names = []
+    for i, it in enumerate(items):
+        it["idx"] = i
+        try:
+            it["cs_id"] = int(it["cs_obj"].CoordinateSystemID)
+        except:
+            it["cs_id"] = 0
+        it["probe"]     = None
+        it["end_time"]  = end_times[it["step"]]
+        it["x"]         = it["x0"]
+        it["written_x"] = None
+        it["solved_x"]  = None
+        it["hist"]      = []
+        it["converged"] = False
+        it["F"]         = None
+        it["F_final"]   = None
+
+    titles = []
+    for n_i, it in enumerate(items):
+        t = str(n_i + 1) + u".  " + it["contact"].Name
+        if ckey(it["fcontact"]) != ckey(it["contact"]):
+            t += u"   ->   force @ " + it["fcontact"].Name
+        t += u"   [step " + str(it["step"]) + u",  target " + fmt_val(it["target"] / 1000.0) + u" kN " + tol_text(it) + u"]"
+        titles.append(t)
+    try:
+        prog.enable_log(titles)
+    except:
+        pass
+
+    iters_done = 0
+    snips      = []
+    try:
+        for si, s in enumerate(steps):
+            if err is not None or cancelled[0]:
+                break
+            stage_items = [it for it in items if it["step"] == s]
+            cut_stage   = bool(use_cut and s < total_steps)
+
+            # bu asamanin probe'lari (onceki asamalarinkiler yerinde kalir)
+            for it in stage_items:
+                pname = u"Preload_" + it["fcontact"].Name
+                if pname in used_names:
+                    pname = pname + u" #" + str(it["idx"] + 1)
+                used_names.append(pname)
+                it["probe"] = create_probe(solution, pname, it["fcontact"], it["cs_obj"])
+            if cut_stage:
+                snips = add_read_snippets(analysis, stage_items, s)
+
+            for k in range(1, max_iter + 1):
+                if cancelled[0]:
+                    break
+                iters_done += 1
+                tag = (u"Step " + str(s) + u"  (" + str(si + 1) + u"/" + str(len(steps)) +
+                       u")  -  iteration " + str(k) + u"/" + str(max_iter))
+
+                # 1) bu asamadaki satirlarin komutlarini yaz
+                prog.update(tag + u"  -  writing commands", u"")
+                for it in stage_items:
+                    if it["written_x"] is None or abs(it["written_x"] - it["x"]) > 0.0:
+                        set_cmd_value(analysis, it["step"], it["cid"], fmt_val(it["x"]))
+                        it["written_x"] = it["x"]
+
+                # 1b) denemeyi hemen goster: interference degeri yazilir, force cozumden sonra eklenir
+                for it in stage_items:
+                    prog.begin_trial(it["idx"], u"Trial " + str(len(it["hist"]) + 1) + u":   preload " +
+                                     fmt_val(it["x"]) + u" mm   ->   solving...")
+
+                # 2) coz (her zaman bastan)
+                if cut_stage:
+                    prog.update(tag + u"  -  solving",
+                                u"From the beginning  |  solver stops after step " + str(s) + u" of " + str(total_steps))
+                    clean_iter_files(workdir, items)
+                else:
+                    prog.update(tag + u"  -  solving", u"From the beginning  |  full analysis")
+                clear_generated(analysis)
+                solve_err, was_canc = solve_interruptible(analysis, cancelled, workdir)
+                if solve_err:
+                    solve_err = u"Solve error: " + solve_err
+                if cancelled[0] or was_canc:
+                    break
+
+                # 3) oku: TEK evaluate (durdurulan cozumde de tamamlanan step'ler icin)
+                try:
+                    if solve_err is None:
+                        try:
+                            stx = unicode(str(analysis.Solution.Status)).lower()
+                        except Exception:
+                            stx = u""
+                        if cut_stage:
+                            if u"fail" in stx:
+                                solve_err = u"Solve failed (status: " + stx + u")"
+                        elif not solve_ok(analysis):
+                            solve_err = u"Solution did not finish successfully (status: " + stx + u")"
+                    if solve_err is not None:
+                        err = solve_err + rs_solver_errors(workdir)
+                        break
+                    prog.update(tag + u"  -  evaluating", u"")
+                    fmap = read_probes_once(solution, stage_items)
+                    for it in stage_items:
+                        F = fmap[it["idx"]]
+                        it["F"] = F
+                        it["solved_x"] = it["x"]
+                        it["hist"].append((it["x"], F))
+                except Exception as ex2:
+                    err = u"Could not read results: " + unicode(str(ex2))
+                    break
+
+                # 4) bu asamanin yakinsama kontrolu + yeni deger
+                all_ok = True
+                for it in stage_items:
+                    it["converged"] = tol_ok(it, it["F"])
+                    if not it["converged"]:
+                        all_ok = False
+                    prog.log_trial(it["idx"],
+                                   u"Trial " + str(len(it["hist"])) + u":   preload " + fmt_val(it["x"]) + u" mm   ->   force " +
+                                   fmt_val(it["F"] / 1000.0) + u" kN   [" + (u"OK" if it["converged"] else u"out of tolerance") + u"]",
+                                   it["converged"])
+                if all_ok or k == max_iter:
+                    break
+                for it in stage_items:
+                    if not it["converged"]:
+                        it["x"] = next_value(it["hist"], aim_force(it))
+
+            # asama tutturulamadiysa DUR (sonraki asamalara gecme)
+            if err is None and not cancelled[0]:
+                bad = [it for it in stage_items if not it["converged"]]
+                if bad:
+                    err = (u"Step " + str(s) + u": the preload did not reach the target within " + str(max_iter) +
+                           u" iterations. Not converged: " +
+                           u", ".join([str(it["idx"] + 1) + u" (" + fmt_val(it["F"] / 1000.0) + u" kN, target " +
+                                       fmt_val(it["target"] / 1000.0) + u" kN)" for it in bad]) +
+                           u". The remaining steps were not processed; the last tried interference values are kept in the commands.")
+
+            # asama bitti: bu asamanin durdurma snippet'ini kaldir
+            delete_snippets(snips)
+            snips = []
+            clean_iter_files(workdir, items)
+    finally:
+        delete_snippets(snips)
+        clean_iter_files(workdir, items)
+
+    if cancelled[0]:
+        return iters_done, None
+
+    # 5) bitis: EN SON cozulen interference degerleri ile devam
+    if err is None:
+        for it in items:
+            if len(it["hist"]) == 0:
+                continue
+            it["x"] = it["hist"][-1][0]
+            it["F"] = it["hist"][-1][1]
+            it["converged"] = tol_ok(it, it["F"])
+            if it["written_x"] is None or abs(it["written_x"] - it["x"]) > 0.0:
+                set_cmd_value(analysis, it["step"], it["cid"], fmt_val(it["x"]))
+                it["written_x"] = it["x"]
+
+        have_hist  = (len([it for it in items if len(it["hist"]) > 0]) == len(items))
+        full_valid = False
+        if last_cut:
+            if final_solve and not cancelled[0] and have_hist:
+                prog.update(u"Final solve...", u"From the beginning, all " + str(total_steps) + u" steps")
+                try:
+                    prog.update(u"Final solve...", u"Clearing the generated data, then solving from the beginning")
+                    clear_generated(analysis)
+                    serr, canc = solve_interruptible(analysis, cancelled, workdir)
+                    if serr:
+                        raise Exception(serr)
+                    if canc or cancelled[0]:
+                        return iters_done, None
+                    full_valid = solve_ok(analysis)
+                    if not full_valid:
+                        err = u"Final solve did not finish successfully (status: " + unicode(str(analysis.Solution.Status)) + u")"
+                except Exception as ex4:
+                    err = u"Final solve error: " + unicode(str(ex4))
+        else:
+            full_valid = have_hist
+
+        FINAL_STATE["valid"] = bool(full_valid)
+
+        # Final reaction force'lar: TEK evaluate
+        if full_valid:
+            prog.update(u"Evaluating final reaction forces...", u"")
+            try:
+                fmap = read_probes_once(solution, items)
+                for it in items:
+                    it["F_final"] = fmap.get(it["idx"])
+            except Exception:
+                pass
+
+        # Probe'lara bilgi amacli comment: Excel tablosu (kopyala -> comment'e yapistir), sonra Excel kapatilir
+        if have_hist:
+            prog.update(u"Creating the summary tables...", u"")
+            try:
+                htmls = build_comment_tables(items)
+            except Exception:
+                htmls = {}
+            for it in items:
+                try:
+                    add_probe_comment(it, iters_done, htmls.get(it["idx"]))
+                except:
+                    pass
+
+    return iters_done, err
+
+# ---------------------------------------------------------------
+# Kontak agaci  (GroupBox icinde, checkbox'li; Neuber stilinde)
+# ---------------------------------------------------------------
+class ContactTree(object):
+    def __init__(self, parent, x, y, w, h, connections):
+        self.connections  = connections
+        self.start_cid    = 0
+        self.all_contacts = []
+        self._ordered     = []       # (node, contact, existing_cid)
+        self._groups      = []
+        self._updating    = False
+
+        gc = GroupBox()
+        gc.Text     = u"Contacts  (check to select)"
+        gc.Font     = FB
+        gc.Location = Point(x, y)
+        gc.Size     = Size(w, h)
+        gc.Anchor   = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        parent.Controls.Add(gc)
+        self.group = gc
+
+        self.lblInfo = label(gc, u"", 12, 22, w - 24, 17, F, MUTED)
+        self.lblInfo.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+
+        self.tv = TreeView()
+        self.tv.Font          = F
+        self.tv.Location      = Point(12, 44)
+        self.tv.Size          = Size(w - 24, h - 108)
+        self.tv.BorderStyle   = BorderStyle.FixedSingle
+        self.tv.CheckBoxes    = True
+        self.tv.ShowLines     = True
+        self.tv.ShowPlusMinus = True
+        self.tv.ShowRootLines = True
+        self.tv.Anchor        = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        gc.Controls.Add(self.tv)
+        self.tv.AfterCheck += self._on_node_check
+
+        self.lblCid = label(gc, u"", 12, h - 60, w - 24, 17, F, MUTED)
+        self.lblCid.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+
+        b_all = button(gc, u"Select All", 12, h - 38, 100)
+        b_all.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+        b_all.Click += self._on_select_all
+        b_clr = button(gc, u"Clear All", 120, h - 38, 100)
+        b_clr.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+        b_clr.Click += self._on_clear
+
+        self.reload(False)
+
+    def reload(self, keep_checked=True):
+        """Agaci modelden yeniden kurar (yeni CID'ler gorunsun diye); isaretli kontaklar korunur."""
+        keep = {}
+        if keep_checked:
+            for (node, c, ex) in self._ordered:
+                if node.Checked:
+                    keep[ckey(c)] = True
+        self._updating = True
+        self.tv.Nodes.Clear()
+        self._ordered = []
+        self._groups  = []
+        self.start_cid = find_max_existing_cid(self.connections)
+        root = build_contact_tree(self.connections)
+        self.all_contacts = [(c.Name, c) for c in flatten_contacts(root)]
+        for c in root[1]:                      # gruba bagli olmayan kontaklar kokte
+            self.tv.Nodes.Add(self._contact_node(c))
+        for g in root[2]:
+            self.tv.Nodes.Add(self._add_group(g))
+        for (node, c, ex) in self._ordered:
+            if ckey(c) in keep:
+                node.Checked = True
+        self._refresh_groups()
+        self._updating = False
+        self.tv.ExpandAll()
+        self.lblInfo.Text = (u"[cid_N] = existing CID will be reused     |     suppressed contacts hidden: " +
+                             str(HIDDEN_SUPPRESSED[0]))
+        if self.start_cid > 0:
+            self.lblCid.Text = (u"Existing CIDs up to cid_" + str(self.start_cid) +
+                                u"  ->  new contacts will get cid_" + str(self.start_cid + 1) + u"+")
+        else:
+            self.lblCid.Text = u"No existing CIDs  ->  will start from cid_1"
+
+    def _refresh_groups(self):
+        for gn in reversed(self._groups):          # once en ic gruplar
+            gn.Checked = (gn.Nodes.Count > 0 and all(ch.Checked for ch in gn.Nodes))
+
+    def checked_keys(self):
+        return [ckey(c) for (node, c, ex) in self._ordered if node.Checked]
+
+    def set_checked(self, keys):
+        want = {}
+        for k in keys:
+            want[k] = True
+        self._updating = True
+        for (node, c, ex) in self._ordered:
+            node.Checked = (ckey(c) in want)
+        self._refresh_groups()
+        self._updating = False
+
+    def _contact_node(self, c):
+        ex = get_existing_cid(c)
+        if ex is not None:
+            txt = c.Name + u"  [cid_" + str(ex) + u"]"
+        else:
+            txt = c.Name
+        ch          = TreeNode(txt)
+        ch.Tag      = u"CONTACT"
+        ch.NodeFont = F
+        self._ordered.append((ch, c, ex))
+        return ch
+
+    def _add_group(self, g):
+        gn          = TreeNode(g[0] + u"  [" + str(count_contacts(g)) + u" contacts]")
+        gn.Tag      = u"GROUP"
+        gn.NodeFont = FB
+        self._groups.append(gn)
+        for c in g[1]:
+            gn.Nodes.Add(self._contact_node(c))
+        for sg in g[2]:
+            gn.Nodes.Add(self._add_group(sg))
+        return gn
+
+    def selected(self):
+        """Isaretli kontaklar: [(contact, existing_cid)]  (agactaki sira korunur)"""
+        out = []
+        for (node, c, ex) in self._ordered:
+            if node.Checked:
+                out.append((c, ex))
+        return out
+
+    def _set_desc(self, node, state):
+        for child in node.Nodes:
+            child.Checked = state
+            self._set_desc(child, state)
+
+    def _on_node_check(self, sender, e):
+        if self._updating:
+            return
+        self._updating = True
+        node = e.Node
+        if str(node.Tag) == u"GROUP":
+            self._set_desc(node, node.Checked)
+        parent = node.Parent
+        while parent is not None:
+            parent.Checked = all(child.Checked for child in parent.Nodes)
+            parent = parent.Parent
+        self._updating = False
+        Application.DoEvents()
+
+    def _set_all(self, state):
+        self._updating = True
+        for gn in self._groups:
+            gn.Checked = state
+        for (node, c, ex) in self._ordered:
+            node.Checked = state
+        self._updating = False
+
+    def _on_select_all(self, sender, e):
+        self._set_all(True)
+
+    def _on_clear(self, sender, e):
+        self._set_all(False)
+
+
+# ---------------------------------------------------------------
+# Sonuc ozeti penceresi (MessageBox yerine, Neuber stilinde)
+# ---------------------------------------------------------------
+class SummaryForm(Form):
+    def __init__(self, title, head, head_color, body):
+        self.Text = title
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+        self.ClientSize      = Size(780, 480)
+        self.MinimumSize     = Size(500, 320)
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.BackColor       = BG
+        self.Font            = F
+
+        lh = label(self, head, 14, 12, 752, 24, FH, head_color)
+        lh.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+
+        tb = TextBox()
+        tb.Multiline   = True
+        tb.ReadOnly    = True
+        tb.WordWrap    = True
+        tb.ScrollBars  = ScrollBars.Vertical
+        tb.Font        = Font("Consolas", 9.0)
+        tb.BackColor   = Color.White
+        tb.BorderStyle = BorderStyle.FixedSingle
+        tb.Location    = Point(14, 44)
+        tb.Size        = Size(752, 380)
+        tb.Anchor      = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        tb.Text        = body.replace(u"\r\n", u"\n").replace(u"\n", u"\r\n")
+        tb.TabStop     = False
+        self.Controls.Add(tb)
+
+        b = button(self, u"Close", 656, 436, 110, primary=True)
+        b.Anchor = AnchorStyles.Bottom | AnchorStyles.Right
+        b.Click += self._on_close
+        self.AcceptButton = b
+        self.ActiveControl = b
+
+    def _on_close(self, sender, e):
+        self.Close()
+
+
+# ---------------------------------------------------------------
+# Kontak bazli onceki secimler (kalici): ayni kontak tekrar secildiginde varsayilan olarak gelir
+# Dosya: %APPDATA%\\PreloadIterTool\\contact_settings.json   (proje klasorune gore ayrilir)
+# ---------------------------------------------------------------
+def prefs_file():
+    try:
+        base = System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData)
+        d = os.path.join(unicode(base), u"PreloadIterTool")
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        return os.path.join(d, u"contact_settings.json")
+    except Exception:
+        return None
+
+def prefs_project_key(analysis):
+    try:
+        return unicode(analysis.WorkingDir).lower()
+    except Exception:
+        return u"default"
+
+def pref_key(contact):
+    return ckey(contact) + u"|" + unicode(contact.Name)
+
+def _read_prefs_file():
+    pth = prefs_file()
+    if json is None or not pth or not os.path.exists(pth):
+        return {}
+    try:
+        f = open(pth, "r")
+        try:
+            return json.load(f)
+        finally:
+            f.close()
+    except Exception:
+        return {}
+
+def load_prefs(pkey):
+    return _read_prefs_file().get(pkey, {})
+
+def find_pref(prefs, contact):
+    """Once tam anahtar (kimlik|isim); bulunamazsa ayni isimli TEK kayit."""
+    if not prefs:
+        return None
+    k = pref_key(contact)
+    if k in prefs:
+        return prefs[k]
+    nm = u"|" + unicode(contact.Name)
+    cands = [v for (kk, v) in prefs.items() if kk.endswith(nm)]
+    if len(cands) == 1:
+        return cands[0]
+    return None
+
+def save_prefs(pkey, items):
+    """Iterasyon bitse de bitmese de (hata/iptal dahil) son secimler ve son interference degeri kaydedilir."""
+    pth = prefs_file()
+    if json is None or not pth:
+        return
+    try:
+        data = _read_prefs_file()
+        proj = data.get(pkey, {})
+        for it in items:
+            try:
+                mode = it.get("tol_mode", u"both")
+                sign = u"-" if mode == u"lower" else (u"+" if mode == u"upper" else u"")
+                x = it.get("x", it.get("x0"))
+                proj[pref_key(it["contact"])] = {
+                    "fkey":   ckey(it["fcontact"]),
+                    "fname":  unicode(it["fcontact"].Name),
+                    "step":   int(it["step"]),
+                    "dir":    unicode(it["dir"]),
+                    "cs":     it.get("cs_name"),
+                    "target": float(it["target"]) / 1000.0,
+                    "tol":    sign + fmt_val(it["tol"]),
+                    "x":      float(x)}
+            except Exception:
+                pass
+        data[pkey] = proj
+        f = open(pth, "w")
+        try:
+            json.dump(data, f)
+        finally:
+            f.close()
+    except Exception:
+        pass
+
+
+def snippet_step_number(ch):
+    snum = None
+    try:
+        snum = int(ch.StepNumber)
+    except Exception:
+        pass
+    try:
+        snum = int(ch.InternalObject.StepNumber)
+    except Exception:
+        pass
+    return snum
+
+def find_existing_preloads(analysis):
+    """
+    Analizdeki command snippet'lerinde onceden yazilmis 'Rmodif,cid_N,10,deger' satirlari.
+    Donen: {cid numarasi: (step, interference degeri)}  (ayni cid birden fazla step'te varsa en son step)
+    """
+    pat = re.compile(r"Rmodif\s*,\s*cid_(\d+)\s*,\s*10\s*,\s*([-+0-9.eE]+)", re.I)
+    out = {}
+    try:
+        children = list(analysis.Children)
+    except Exception:
+        return out
+    for ch in children:
+        try:
+            if "CommandSnippet" not in ch.GetType().ToString():
+                continue
+            st = snippet_step_number(ch)
+            if st is None:
+                continue
+            for line in ch.Input.split(u"\n"):
+                m = pat.search(line)
+                if not m:
+                    continue
+                cid = int(m.group(1))
+                try:
+                    val = float(m.group(2))
+                except Exception:
+                    continue
+                if cid not in out or st >= out[cid][0]:
+                    out[cid] = (st, val)
+        except Exception:
+            pass
+    return out
+
+# ---------------------------------------------------------------
+# ADIM 3 (sadece Preload > Iteration): kontak basina ayarlar
+# ---------------------------------------------------------------
+class IterParamForm(Form):
+    DIRS = [u"X", u"Y", u"Z", u"Total"]
+
+    def __init__(self, selected, step_count, cs_names, all_contacts, prefs=None, existing=None):
+        self.Text            = u"Preload Iteration Settings"
+        n_rows   = len(selected)
+        vis_rows = min(n_rows, 6)
+        pnl_h    = vis_rows * 70 + 4
+        y_fill   = 12 + pnl_h + 6
+        y_grp    = y_fill + 34
+        n_restored = len([1 for (c_, e_) in selected
+                          if find_pref(prefs, c_) or (existing and e_ is not None and e_ in existing)])
+        grp_h    = 112 + (26 if n_restored else 0)
+        y_btn    = y_grp + grp_h + 14
+        self.ClientSize      = Size(1100, y_btn + 32 + 14)
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox     = False
+        self.MinimizeBox     = False
+        self.BackColor       = BG
+        self.Font            = F
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+        self.items_out       = []
+        self.max_iter        = 10
+        self.truncate        = True
+        self.final_solve     = True
+        self._selected       = selected
+        self._all_contacts   = all_contacts
+        self._rows           = []
+
+        base_font       = F
+        self.base_font  = base_font
+        self.font_bold  = Font(base_font, FontStyle.Bold)
+        font_title      = Font(base_font.FontFamily, 9, FontStyle.Bold)
+
+        def mk_label(text, x, y, w, bold=False):
+            l = Label()
+            l.Text      = text
+            l.Font      = self.font_bold if bold else base_font
+            l.Location  = Point(x, y + 1)
+            l.Size      = Size(w, 22)
+            l.TextAlign = ContentAlignment.MiddleLeft
+            l.AutoEllipsis = True
+            l.ForeColor = DARK
+            return l
+
+        self.pnl = Panel()
+        self.pnl.AutoScroll = True
+        self.pnl.Location   = Point(14, 12)
+        self.pnl.Size       = Size(1072, pnl_h)
+        self.Controls.Add(self.pnl)
+
+        row_h = 70
+        for i, (contact, ex_cid) in enumerate(selected):
+            rp = Panel()
+            rp.Location  = Point(0, i * row_h)
+            rp.Size      = Size(1046, row_h - 4)
+            pr0  = find_pref(prefs, contact)
+            cmd0 = existing.get(ex_cid) if (existing and ex_cid is not None) else None   # modeldeki mevcut preload komutu
+            rp.BackColor = ORANGE_ROW if (pr0 or cmd0) else (ROW_A if (i % 2 == 0) else ROW_B)
+            self.pnl.Controls.Add(rp)
+
+            # --- satir 1: interference kontagi + force okunacak kontak (bos gelir, kullanici secer)
+            y1 = 6
+            lbl_no = mk_label(str(i + 1) + u".", 4, y1, 30, True)
+            lbl_no.ForeColor = ACCENT
+            lbl_no.Font      = Font("Segoe UI", 10.0, FontStyle.Bold)
+            rp.Controls.Add(lbl_no)
+            rp.Controls.Add(mk_label(u"Preload on:", 36, y1, 78, True))
+            rp.Controls.Add(mk_label(contact.Name, 116, y1, 396))
+            rp.Controls.Add(mk_label(u"Read force at:", 520, y1, 96, True))
+
+            cb_force = make_no_scroll_combo()
+            cb_force.DropDownStyle = ComboBoxStyle.DropDownList
+            cb_force.Font          = base_font
+            cb_force.Location      = Point(620, y1)
+            cb_force.Size          = Size(410, 24)
+            pr = find_pref(prefs, contact)      # bu kontagin onceki secimleri (varsa)
+            sel_idx = -1
+            for j, (nm, obj) in enumerate(all_contacts):
+                cb_force.Items.Add(nm)
+                if ckey(obj) == ckey(contact):
+                    sel_idx = j                 # varsayilan: preload uygulanan kontakla ayni
+            if pr:
+                for j, (nm, obj) in enumerate(all_contacts):
+                    if ckey(obj) == pr.get("fkey"):
+                        sel_idx = j
+            cb_force.SelectedIndex = sel_idx
+            fit_dropdown(cb_force, base_font)
+            rp.Controls.Add(cb_force)
+
+            # --- satir 2: step / yon / CS / hedef / tolerans / ilk deger (ilk deger haric hepsi bos)
+            y2 = 36
+            rp.Controls.Add(mk_label(u"Step:", 4, y2, 40))
+            cb_step = make_no_scroll_combo()
+            cb_step.DropDownStyle = ComboBoxStyle.DropDownList
+            cb_step.Font     = base_font
+            cb_step.Location = Point(46, y2)
+            cb_step.Size     = Size(60, 24)
+            for s_ in range(1, step_count + 1):
+                cb_step.Items.Add(str(s_))
+            ps = pr.get("step") if pr else None
+            if ps is None and cmd0:
+                ps = cmd0[0]                    # mevcut komutun step'i
+            cb_step.SelectedIndex = (ps - 1) if (ps and 1 <= ps <= step_count) else -1
+            fit_dropdown(cb_step, base_font)
+            rp.Controls.Add(cb_step)
+
+            rp.Controls.Add(mk_label(u"Direction:", 116, y2, 66))
+            cb_dir = make_no_scroll_combo()
+            cb_dir.DropDownStyle = ComboBoxStyle.DropDownList
+            cb_dir.Font     = base_font
+            cb_dir.Location = Point(184, y2)
+            cb_dir.Size     = Size(74, 24)
+            for d in IterParamForm.DIRS:
+                cb_dir.Items.Add(d)
+            cb_dir.SelectedIndex = IterParamForm.DIRS.index(pr["dir"]) if (pr and pr.get("dir") in IterParamForm.DIRS) else -1
+            fit_dropdown(cb_dir, base_font)
+            rp.Controls.Add(cb_dir)
+
+            rp.Controls.Add(mk_label(u"Coordinate system:", 268, y2, 118))
+            cb_cs = make_no_scroll_combo()
+            cb_cs.DropDownStyle = ComboBoxStyle.DropDownList
+            cb_cs.Font     = base_font
+            cb_cs.Location = Point(388, y2)
+            cb_cs.Size     = Size(190, 24)
+            for n in cs_names:
+                cb_cs.Items.Add(n)
+            cb_cs.SelectedIndex = cs_names.index(pr["cs"]) if (pr and pr.get("cs") in cs_names) else -1
+            fit_dropdown(cb_cs, base_font)
+            rp.Controls.Add(cb_cs)
+
+            rp.Controls.Add(mk_label(u"Target [kN]:", 588, y2, 76))
+            t_target = TextBox()
+            t_target.Text     = fmt_val(pr["target"]) if (pr and pr.get("target") is not None) else u""
+            t_target.Location = Point(666, y2)
+            t_target.Size     = Size(72, 24)
+            rp.Controls.Add(t_target)
+
+            rp.Controls.Add(mk_label(u"Tolerance [%]:", 748, y2, 92))
+            t_tol = TextBox()
+            t_tol.Text     = unicode(pr["tol"]) if (pr and pr.get("tol")) else u""
+            t_tol.Location = Point(842, y2)
+            t_tol.Size     = Size(50, 24)
+            rp.Controls.Add(t_tol)
+
+            rp.Controls.Add(mk_label(u"Initial [mm]:", 902, y2, 76))
+            t_x0 = TextBox()
+            if cmd0:
+                t_x0.Text = fmt_val(cmd0[1])    # modeldeki mevcut interference degeri
+            elif pr and pr.get("x") is not None:
+                t_x0.Text = fmt_val(pr["x"])
+            else:
+                t_x0.Text = u"0.05"
+            t_x0.Location = Point(980, y2)
+            t_x0.Size     = Size(62, 24)
+            rp.Controls.Add(t_x0)
+
+            if pr0 or cmd0:
+                for ctl in (cb_force, cb_step, cb_dir, cb_cs, t_target, t_tol, t_x0):
+                    try:
+                        ctl.BackColor = ORANGE_CTRL
+                    except Exception:
+                        pass
+            self._rows.append((contact, ex_cid, cb_force, cb_step, cb_dir, cb_cs, t_target, t_tol, t_x0))
+
+        btn_fill = Button()
+        btn_fill.Text      = u"Copy first row settings to all"
+        btn_fill.Font      = base_font
+        btn_fill.FlatStyle = FlatStyle.Standard
+        btn_fill.Location  = Point(14, y_fill)
+        btn_fill.Size      = Size(236, 28)
+        btn_fill.Click    += self._on_fill
+        self.Controls.Add(btn_fill)
+
+        grp = GroupBox()
+        grp.Text     = u"Iteration Options"
+        grp.Font     = font_title
+        grp.Location = Point(14, y_grp)
+        grp.Size     = Size(1072, grp_h)
+        self.Controls.Add(grp)
+
+        l2 = Label()
+        l2.Text     = u"Max iterations (per step):"
+        l2.Font     = base_font
+        l2.Location = Point(12, 26)
+        l2.Size     = Size(170, 20)
+        grp.Controls.Add(l2)
+
+        hint = Label()
+        hint.Text      = u"Tolerance:  1 = either side   |   -1 = only below the target   |   +1 = only above the target"
+        hint.Font      = base_font
+        hint.ForeColor = MUTED
+        hint.Location  = Point(290, 26)
+        hint.Size      = Size(760, 20)
+        grp.Controls.Add(hint)
+
+        if n_restored:
+            sw = Panel()
+            sw.BackColor = ORANGE_CTRL
+            sw.Location  = Point(12, 108)
+            sw.Size      = Size(18, 18)
+            grp.Controls.Add(sw)
+            note = Label()
+            note.Text      = (u"Orange rows: restored from an earlier selection and/or read from the preload command already in the model "
+                              u"(interference = the command's current value). You can change them.")
+            note.Font      = base_font
+            note.ForeColor = WARN
+            note.Location  = Point(36, 107)
+            note.Size      = Size(1020, 20)
+            grp.Controls.Add(note)
+
+        self.t_maxit = TextBox()
+        self.t_maxit.Text     = u"10"
+        self.t_maxit.Location = Point(188, 23)
+        self.t_maxit.Size     = Size(60, 24)
+        grp.Controls.Add(self.t_maxit)
+
+        self.chk_trunc = CheckBox()
+        self.chk_trunc.Text     = u"Stop each solve right after the last control step (solver is aborted, forces are read from the evaluated probes)"
+        self.chk_trunc.Font     = base_font
+        self.chk_trunc.Checked  = True
+        self.chk_trunc.Location = Point(12, 52)
+        self.chk_trunc.Size     = Size(1040, 22)
+        grp.Controls.Add(self.chk_trunc)
+
+        self.chk_final = CheckBox()
+        self.chk_final.Text     = u"Run the full analysis with the last interference values after the iteration ends and report the reaction forces"
+        self.chk_final.Font     = base_font
+        self.chk_final.Checked  = True
+        self.chk_final.Location = Point(12, 78)
+        self.chk_final.Size     = Size(1040, 22)
+        grp.Controls.Add(self.chk_final)
+
+        btn_back = Button()
+        btn_back.Text      = u"< Back"
+        btn_back.Font      = base_font
+        btn_back.FlatStyle = FlatStyle.Standard
+        btn_back.Location  = Point(14, y_btn)
+        btn_back.Size      = Size(90, 32)
+        btn_back.Click    += self._on_back
+        self.Controls.Add(btn_back)
+
+        btn_cancel = Button()
+        btn_cancel.Text         = u"Cancel"
+        btn_cancel.Font         = base_font
+        btn_cancel.FlatStyle    = FlatStyle.Standard
+        btn_cancel.Location     = Point(876, y_btn)
+        btn_cancel.Size         = Size(90, 32)
+        btn_cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(btn_cancel)
+        self.CancelButton = btn_cancel
+
+        btn_start = Button()
+        btn_start.Text      = u"Start"
+        btn_start.Font      = self.font_bold
+        btn_start.FlatStyle = FlatStyle.Standard
+        btn_start.Location  = Point(976, y_btn)
+        btn_start.Size      = Size(110, 32)
+        btn_start.Click    += self._on_start
+        self.Controls.Add(btn_start)
+        apply_theme(self)
+
+    def _on_fill(self, sender, e):
+        if len(self._rows) < 2:
+            return
+        r0 = self._rows[0]
+        for r in self._rows[1:]:
+            r[3].SelectedIndex = r0[3].SelectedIndex
+            r[4].SelectedIndex = r0[4].SelectedIndex
+            r[5].SelectedIndex = r0[5].SelectedIndex
+            r[6].Text = r0[6].Text
+            r[7].Text = r0[7].Text
+            r[8].Text = r0[8].Text
+
+    def _on_back(self, sender, e):
+        self.DialogResult = DialogResult.Retry
+        self.Close()
+
+    def _on_start(self, sender, e):
+        def num(tb):
+            try:
+                return float(tb.Text.strip().replace(u",", u"."))
+            except Exception:
+                return None
+        out = []
+        problems = []
+        for i, (contact, ex_cid, cb_force, cb_step, cb_dir, cb_cs, t_target, t_tol, t_x0) in enumerate(self._rows):
+            miss = []
+            if cb_force.SelectedIndex < 0:
+                miss.append(u"Read force at")
+            if cb_step.SelectedIndex < 0:
+                miss.append(u"Step")
+            if cb_dir.SelectedIndex < 0:
+                miss.append(u"Direction")
+            if cb_cs.Items.Count > 0 and cb_cs.SelectedIndex < 0:
+                miss.append(u"Coordinate system")
+            target = num(t_target)
+            tol_txt  = t_tol.Text.strip().replace(u",", u".")
+            tol_mode = u"both"
+            if tol_txt.startswith(u"-"):
+                tol_mode = u"lower"
+                tol_txt  = tol_txt[1:]
+            elif tol_txt.startswith(u"+"):
+                tol_mode = u"upper"
+                tol_txt  = tol_txt[1:]
+            try:
+                tol = float(tol_txt)
+            except Exception:
+                tol = None
+            x0     = num(t_x0)
+            if target is None or target <= 0:
+                miss.append(u"Target [kN]")
+            if tol is None or tol <= 0:
+                miss.append(u"Tolerance [%]")
+            if x0 is None or x0 <= 0:
+                miss.append(u"Initial [mm]")
+            if miss:
+                problems.append(str(i + 1) + u". " + contact.Name + u":  " + u", ".join(miss))
+                continue
+            cs_name = None
+            if cb_cs.SelectedIndex >= 0:
+                cs_name = unicode(cb_cs.SelectedItem)
+            out.append({"contact": contact, "existing_cid": ex_cid,
+                        "fcontact": self._all_contacts[cb_force.SelectedIndex][1],
+                        "step": cb_step.SelectedIndex + 1,
+                        "dir": IterParamForm.DIRS[cb_dir.SelectedIndex],
+                        "cs_name": cs_name,
+                        "target": target * 1000.0, "tol": tol, "tol_mode": tol_mode, "x0": x0})   # ekranda kN, icerde N
+        mi = None
+        try:
+            mi = int(self.t_maxit.Text.strip())
+        except Exception:
+            mi = None
+        if mi is None or mi < 1:
+            problems.append(u"Max iterations (per step): enter a whole number >= 1")
+        if problems:
+            MessageBox.Show(u"Please fill in / correct the following:\n\n" + u"\n".join(problems),
+                            u"Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
+        self.items_out   = out
+        self.max_iter    = mi
+        self.truncate    = self.chk_trunc.Checked
+        self.final_solve = self.chk_final.Checked
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+
+# ---------------------------------------------------------------
+# ANA PENCERE  (Neuber arayuz duzeni: Mode / Input / Contacts / Results / durum satiri)
+# ---------------------------------------------------------------
+class PreloadForm(Form):
+    def __init__(self, model, analysis, connections, step_count, cs_names, state):
+        self.state       = state
+        self.job         = None
+        self.model       = model
+        self.analysis    = analysis
+        self.connections = connections
+        self.step_count  = step_count
+        self.cs_names    = cs_names
+        self.cmd_mode    = u"manual"
+
+        self.Text = u"Preload Command"
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+        W, H = 496, 700
+        self.ClientSize      = Size(W + 24, H)
+        self.MinimumSize     = Size(540, 640)
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.BackColor       = BG
+        self.Font            = F
+
+        # Mod
+        gm = GroupBox()
+        gm.Text     = u"Mode"
+        gm.Font     = FB
+        gm.Location = Point(12, 10)
+        gm.Size     = Size(W, 60)
+        gm.Anchor   = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        self.Controls.Add(gm)
+        self.btnManual = button(gm, u"Manual", 12, 22, 232)
+        self.btnIter   = button(gm, u"Iteration", 252, 22, 232)
+        self.btnManual.Click += self.on_mode_manual
+        self.btnIter.Click   += self.on_mode_iter
+
+        # Girdi
+        gi = GroupBox()
+        gi.Text     = u"Input"
+        gi.Font     = FB
+        gi.Location = Point(12, 76)
+        gi.Size     = Size(W, 96)
+        gi.Anchor   = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        self.Controls.Add(gi)
+        label(gi, u"Interference [mm]", 12, 22, 126, 18, F, MUTED)
+        label(gi, u"Active at step", 147, 22, 126, 18, F, MUTED)
+        self.txtV = textbox(gi, 12, 43, 126)
+        self.txtV.Text = u"0.05"
+        self.cbStep = combo(gi, 147, 43, 126)
+        for i in range(1, step_count + 1):
+            self.cbStep.Items.Add(u"Step " + str(i))
+        if self.cbStep.Items.Count > 0:
+            self.cbStep.SelectedIndex = 0
+        self.btnGo = button(gi, u"Apply", 282, 40, W - 24 - 270, primary=True)
+        self.btnGo.Anchor = AnchorStyles.Top | AnchorStyles.Right
+        self.btnGo.Click += self.on_go
+        self.lblHint = label(gi, u"", 12, 72, W - 24, 17, F, MUTED)
+
+        # alt kisimlarin yerlesimi
+        st_h = 56
+        st_y = H - 10 - st_h
+        ct_y = 180
+
+        # Kontaklar
+        self.ct = ContactTree(self, 12, ct_y, W, st_y - 6 - ct_y, connections)
+
+        self.lblStatus = label(self, u"Ready", 14, st_y, W - 4, st_h, F, MUTED)
+        self.lblStatus.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+
+        st = self.state
+        if st.get("txt") is not None:
+            self.txtV.Text = st["txt"]
+        if st.get("step") is not None and 0 <= st["step"] < self.cbStep.Items.Count:
+            self.cbStep.SelectedIndex = st["step"]
+        self.ct.set_checked(st.get("checked", []))
+        self.set_mode(st.get("mode", u"manual"))
+        if st.get("status") is not None:
+            self.status(st["status"][0], st["status"][1])
+
+    def status(self, text, color):
+        self.lblStatus.Text = text
+        self.lblStatus.ForeColor = color
+
+    # --- mod secimi ---
+    def set_mode(self, m):
+        self.cmd_mode = m
+        manual = (m == u"manual")
+        style_button(self.btnManual, u"primary" if manual else u"secondary")
+        style_button(self.btnIter, u"secondary" if manual else u"primary")
+        self.txtV.Enabled   = manual
+        self.cbStep.Enabled = manual
+        if manual:
+            self.btnGo.Text = u"Apply"
+            self.lblHint.Text = (u"->  Rmodif,cid_N,10,<value>        (" + str(self.step_count) +
+                                 u" step(s) detected)")
+        else:
+            self.btnGo.Text = u"Next >"
+            self.lblHint.Text = u"Iteration: target force, step, direction and tolerance are set per contact next."
+
+    def on_mode_manual(self, sender, args):
+        self.set_mode(u"manual")
+
+    def on_mode_iter(self, sender, args):
+        self.set_mode(u"iteration")
+
+    # --- Apply / Next ---
+    def on_go(self, sender, args):
+        val = u""
+        step_num = 1
+        if self.cmd_mode == u"manual":
+            val = self.txtV.Text.strip().replace(u",", u".")
+            try:
+                float(val)
+            except Exception:
+                self.status(u"Please enter a valid interference value.", ERR)
+                return
+            if self.cbStep.SelectedIndex < 0:
+                self.status(u"Please select a step.", ERR)
+                return
+            step_num = self.cbStep.SelectedIndex + 1
+        sel = self.ct.selected()
+        if len(sel) == 0:
+            self.status(u"Please select at least one contact.", ERR)
+            return
+        if self.cmd_mode == u"manual":
+            self.run_manual(sel, val, step_num)
+        else:
+            self.start_iteration(sel)
+
+    # --- MANUEL MOD ---
+    def run_manual(self, sel, val, step_num):
+        cancelled  = [False]
+        prog       = ProgressForm()
+        start_time = DateTime.Now
+        err        = None
+        res        = None
+        self.Enabled = False
+        try:
+            prog.Owner = self                 # pencere kapaninca odak bu forma donsun
+            prog.show_with(cancelled)
+            start_cid = find_max_existing_cid(self.connections)
+            cid_list, next_cid, reused, created = assign_cids(sel, start_cid, prog, cancelled)
+            if not cancelled[0]:
+                prog.update(u"Adding solution command to analysis...",
+                            u"Step " + str(step_num) + u"  |  PRELOAD")
+                sol_cmd, is_new = add_or_update_solution_cmd(self.analysis, val, cid_list, step_num)
+                res = (start_cid, next_cid, reused, created, sol_cmd, is_new)
+        except Exception as ex:
+            err = unicode(str(ex))
+        was_cancelled = cancelled[0]            # prog.Close() bu bayragi True yapar, once oku
+        elapsed_sec   = int((DateTime.Now - start_time).TotalSeconds)
+        self.Enabled = True                     # once ana form aktif olsun, sonra progress kapansin
+        try:
+            prog.Close()
+        except Exception:
+            pass
+        self.Activate()
+
+        if err is not None:
+            self.status(u"Error: " + err, ERR)
+        elif was_cancelled or res is None:
+            self.status(u"Operation cancelled by user.", WARN)
+        else:
+            start_cid, next_cid, reused, created, sol_cmd, is_new = res
+            self.status(u"Done.  Interference = " + val + u" mm  at step " + str(step_num) + u"  ->  " +
+                        sol_cmd.Name + (u"  (new command)" if is_new else u"  (existing command updated)") +
+                        u"\n" + str(len(sel)) + u" contact(s):  " + str(reused) + u" reused CID, " +
+                        str(created) + u" new CID  |  " + format_duration(elapsed_sec), OK)
+        try:
+            self.ct.reload()                  # yeni CID'ler agacta gorunsun, secimler korunur
+        except Exception:
+            pass
+
+    # --- ITERASYON MODU ---
+    def save_state(self):
+        st = self.state
+        st["mode"]    = self.cmd_mode
+        st["txt"]     = self.txtV.Text
+        st["step"]    = self.cbStep.SelectedIndex
+        st["checked"] = self.ct.checked_keys()
+
+    def start_iteration(self, sel):
+        if LocationDefinitionMethod is None:
+            self.status(u"LocationDefinitionMethod enum could not be imported; "
+                        u"force reaction probes cannot be created.", ERR)
+            return
+        par_form = IterParamForm(sel, self.step_count, self.cs_names, self.ct.all_contacts,
+                                 load_prefs(prefs_project_key(self.analysis)),
+                                 find_existing_preloads(self.analysis))
+        if par_form.ShowDialog() != DialogResult.OK:
+            return                            # Back / Cancel: ana pencereye don, secimler korunur
+        self.save_state()
+        self.job = par_form                   # pencere kapanir; islem Mechanical'i kilitlemeden ana akista calisir
+        self.Close()
+
+
+def run_iteration_job(model, analysis, connections, par_form):
+    """Pencere kapandiktan sonra calisir: Mechanical kilitlenmez. Doner: (durum_metni, renk), ozet_argumanlari"""
+    items      = par_form.items_out
+    cancelled  = [False]
+    prog       = ProgressForm()
+    start_time = DateTime.Now
+    err        = None
+    iters_done = 0
+    aborted    = False            # CID atama sirasinda iptal edildi
+    start_cid  = 0
+    next_cid   = 0
+    reused     = 0
+    created    = 0
+    try:
+        prog.show_with(cancelled)
+        start_cid = find_max_existing_cid(connections)
+
+        # Interference kontaklari + force okunan kontaklar (tekrarsiz) icin CID ata
+        uniq = []
+        keys = []
+        for it in items:
+            for c in (it["contact"], it["fcontact"]):
+                k = ckey(c)
+                if k not in keys:
+                    keys.append(k)
+                    uniq.append((c, get_existing_cid(c)))
+        cid_list, next_cid, reused, created = assign_cids(uniq, start_cid, prog, cancelled)
+        if cancelled[0]:
+            aborted = True
+        else:
+            cmap   = dict(zip(keys, cid_list))
+            cs_map = dict(get_cs_list(model))
+            for it in items:
+                it["cid"]    = cmap[ckey(it["contact"])]
+                it["fcid"]   = cmap[ckey(it["fcontact"])]
+                it["cs_obj"] = cs_map.get(it["cs_name"])
+            iters_done, err = run_iteration(analysis, items,
+                                            par_form.max_iter, par_form.truncate,
+                                            par_form.final_solve,
+                                            prog, cancelled)
+    except Exception as ex:
+        iters_done = 0
+        err = u"Unexpected error: " + unicode(str(ex))
+
+    try:
+        prog.close_pending(u"   (not completed)")
+    except Exception:
+        pass
+    was_cancelled = cancelled[0]            # prog.Close() bu bayragi True yapar, once oku
+    save_prefs(prefs_project_key(analysis), items)      # tamamlansa da tamamlanmasa da
+    elapsed_sec = int((DateTime.Now - start_time).TotalSeconds)
+    try:
+        prog.Close()
+    except Exception:
+        pass
+
+    if aborted:
+        return (u"Operation cancelled by user.", WARN), None
+
+    lines = []
+    for n_i, it in enumerate(items):
+        if not it.get("hist"):
+            lines.append(str(n_i + 1) + u".  " + it["contact"].Name + u":  no result")
+            continue
+        st_txt = u"OK" if it["converged"] else u"NOT within tolerance"
+        txt = (str(n_i + 1) + u".  " + it["contact"].Name + u"  (interference, cid_" + str(it["cid"]) + u")\n" +
+               u"   force read at: " + it["fcontact"].Name + u"  (step " + str(it["step"]) + u", " + it["dir"] + u")\n" +
+               u"   interference " + fmt_val(it["x"]) + u" mm   |   target " + fmt_val(it["target"] / 1000.0) +
+               u" kN (" + tol_text(it) + u")   |   iteration result " + fmt_val(it["F"] / 1000.0) + u" kN  [" + st_txt + u"]")
+        if it.get("F_final") is not None:
+            txt += u"\n   final reaction force (full solve): " + fmt_val(it["F_final"] / 1000.0) + u" kN"
+        lines.append(txt)
+
+    body = u""
+    if err is not None:
+        body = u"STOPPED: " + err + u"\n\n"
+
+    rs_txt = u""
+    if RS_WARN:
+        rs_txt = u"NOTE           : " + u"; ".join(RS_WARN) + u"\n"
+    if FINAL_STATE["state"]:
+        rs_txt += u"Solution       : " + FINAL_STATE["state"] + u"\n"
+
+    body += (u"Solves run     : " + str(iters_done) + u"   (max " + str(par_form.max_iter) + u" iterations per step)\n" +
+             u"Duration       : " + format_duration(elapsed_sec) + u"\n" + rs_txt + u"\n" +
+             u"\n\n".join(lines))
+
+    if err is not None:
+        head, col = u"Iteration stopped", WARN
+        short = err if len(err) <= 240 else err[:240] + u"..."
+        stat = (u"Stopped: " + short, WARN)
+    elif was_cancelled:
+        head, col = u"Cancelled by user", WARN
+        stat = (u"Cancelled by user.  Solves run: " + str(iters_done), WARN)
+    else:
+        head, col = u"Iteration finished", OK
+        stat = (u"Iteration finished.  Solves run: " + str(iters_done) + u"  |  " +
+                format_duration(elapsed_sec), OK)
+    return stat, (u"Iteration Done", head, col, body)
+
+
+# ---------------------------------------------------------------
+# ANA AKIS
+# ---------------------------------------------------------------
+model       = ExtAPI.DataModel.Project.Model
+connections = model.Connections
+
+contact_tree = build_contact_tree(connections)
+total_count  = count_contacts(contact_tree)
+
+if total_count == 0:
+    MessageBox.Show(u"No contacts found in the analysis.", u"Info",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information)
+else:
+    static_analysis = find_static_structural(model)
+    if static_analysis is None:
+        MessageBox.Show(u"No Static Structural analysis found in the model.", u"Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+    else:
+        step_count = get_step_count(static_analysis)
+        cs_names   = [n for (n, c) in get_cs_list(model)]
+        state      = {}
+        while True:
+            form = PreloadForm(model, static_analysis, connections, step_count, cs_names, state)
+            form.ShowDialog()
+            par_form = form.job
+            if par_form is None:
+                break                          # kullanici pencereyi kapatti
+            # Iterasyon pencere KAPALIYKEN calisir: Mechanical'a erisilebilir, Stop butonu progress penceresinde
+            state["status"], summary = run_iteration_job(model, static_analysis, connections, par_form)
+            if summary is not None:
+                SummaryForm(summary[0], summary[1], summary[2], summary[3]).ShowDialog()
