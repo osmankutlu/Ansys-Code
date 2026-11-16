@@ -1,0 +1,56 @@
+﻿ANALYSIS TRACKER - MAKRO KURULUMU (Excel dosyasini kendiniz olusturun)
+=====================================================================
+
+Bu pakette hazir .xlsm yoktur. Makro metni "analiz takip13 makro.txt" dosyasindadir.
+Asagidaki adimlarla kendi Excel dosyanizi olusturun (yaklasik 5 dakika).
+
+ONCE DOSYALARI YERLESTIRIN (dosyalar tek tek, basinda "analiz takip13 " ile geldi)
+  1. Ag klasorunde "AnalizTakip" adinda bir klasor olusturun.
+  2. Su 4 dosyayi bu klasore koyup adlarindan "analiz takip13 " kismini silin:
+       analiz takip13 AnalizTakip.ps1   ->  AnalizTakip.ps1
+       analiz takip13 Veri.ps1          ->  Veri.ps1
+       analiz takip13 README.txt        ->  README.txt
+       analiz takip13 AdminAccounts.txt ->  AdminAccounts.txt
+     (Adlar tam bu sekilde olmali, yoksa program dosyalari bulamaz.)
+  3. "analiz takip13 Analysis Tracker.cmd" (istege bagli) AnalizTakip klasorunun YANINA konur; adini degistirmeniz gerekmez.
+
+KLASOR DUZENI (paylasimli ag klasorunde)
+  \\sunucu\klasor\
+      Analysis Tracker.xlsm        <- sizin olusturacaginiz dosya
+      AnalizTakip\                 <- bu paketteki klasor (Veri.ps1, AnalizTakip.ps1 ...)
+  Excel dosyasi ile AnalizTakip klasoru AYNI yerde olmali.
+
+ADIM 1 - Excel dosyasi
+  1. Excel'i acin, bos bir calisma kitabi olusturun.
+  2. Dosya > Farkli Kaydet > tur olarak "Excel Makro Iceren Calisma Kitabi (*.xlsm)" secin.
+     Adi: Analysis Tracker.xlsm  - AnalizTakip klasorunun yanina kaydedin.
+
+ADIM 2 - Makroyu ekleme (kodun tamami tek parca yapistirilir)
+  1. Alt+F11 ile VBA editorunu acin.
+  2. Menuden Insert > Module secin (bos bir modul acilir).
+  3. "analiz takip13 makro.txt" dosyasini Not Defteri'nde acin, Ctrl+A, Ctrl+C ile tum metni kopyalayin.
+  4. VBA editorundeki bos module Ctrl+V ile yapistirin.
+  5. (Istege bagli) F4 ile Properties acip modulun (Name) alanini modBaslat yapin.
+  6. Dosyayi kaydedin (Ctrl+S) ve VBA editorunu kapatin.
+
+ADIM 3 - Dugmeleri otomatik olusturma (cizmenize gerek yok)
+  1. VBA editorunde, yapistirdiginiz kodun icinde "Public Sub KurulumYap()" satirinin herhangi bir yerine tiklayin.
+  2. F5 tusuna basin (veya Alt+F8 > KurulumYap > Calistir).
+  3. Sayfa otomatik hazirlanir: baslik ve 3 dugme olusur (Open Analysis Tracker, Open Data Folder, Open Error Log).
+  4. Ctrl+S ile kaydedin (dosya turu .xlsm olmali). Bitti - dugmeler hazir.
+
+ADIM 4 - Guvenlik uyarisi
+  Dosya ag klasorunde oldugu icin "Makrolar devre disi birakildi" uyarisi cikabilir.
+  Dosya > Secenekler > Guven Merkezi > Guven Merkezi Ayarlari > Guvenilen Konumlar >
+  "Yeni konum ekle" ile ag klasorunu ekleyin (alt klasorlere izin verin).
+  Sirket politikasi bunu engelliyorsa BT biriminden bu klasor icin izin isteyin.
+
+ALTERNATIF - Excel/makro olmadan
+  Sirket politikasi makroyu yine de engellerse, "analiz takip13 Analysis Tracker.cmd" dosyasina cift tiklayin
+  (AnalizTakip klasorunun yaninda durmali). Program ayni sekilde acilir. Bu dosyanin kisayolunu
+  masaustune koyabilirsiniz. PowerShell betikleri de engelliyse BT'den izin gerekir.
+
+SORUN GIDERME
+  - "Program file not found": Excel dosyasi ile AnalizTakip klasoru ayni yerde degil.
+  - Hicbir sey acilmiyor: AnalizTakip klasorundeki AnalizTakip.hata.log dosyasina bakin (HataGunluguAc dugmesi).
+  - Excel dosyasi OneDrive/SharePoint adresinden aciliyorsa makro uyari verir; dosyayi ag surucusunden acin.
