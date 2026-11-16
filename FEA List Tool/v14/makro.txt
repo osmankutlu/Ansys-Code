@@ -1,0 +1,129 @@
+Option Explicit
+
+' Opens the Analysis Tracker program in its own window.
+' The program files (AnalizTakip.ps1, Veri.ps1 ...) can be in ANY normal folder:
+' your own PC or a shared network folder. This file does not have to be next to them.
+' The first time, if the program is not found next to this Excel file, a folder
+' picker asks where the "AnalizTakip" folder is; the answer is remembered.
+
+Private Function Gecerli(k As String) As Boolean
+    Gecerli = False
+    If Len(k) = 0 Then Exit Function
+    If LCase(Left(k, 4)) = "http" Then Exit Function
+    Gecerli = (Dir(k & "\AnalizTakip.ps1") <> "")
+End Function
+
+Private Function KlasorSec() As String
+    Dim fd As Object, s As String
+    KlasorSec = ""
+    Set fd = Application.FileDialog(4)
+    fd.Title = "Select the AnalizTakip folder (the folder that contains AnalizTakip.ps1)"
+    If fd.Show <> -1 Then Exit Function
+    s = fd.SelectedItems(1)
+    If Right(s, 1) = "\" Then s = Left(s, Len(s) - 1)
+    If Gecerli(s & "\AnalizTakip") Then s = s & "\AnalizTakip"
+    If Not Gecerli(s) Then
+        MsgBox "AnalizTakip.ps1 was not found in:" & vbCrLf & s, vbExclamation, "Analysis Tracker"
+        Exit Function
+    End If
+    SaveSetting "AnalizTakip", "Ayar", "Klasor", s
+    KlasorSec = s
+End Function
+
+Private Function ProgramKlasoru() As String
+    Dim k As String
+    ' 1) next to this Excel file (only if it is a normal disk path)
+    k = ThisWorkbook.Path & "\AnalizTakip"
+    If Gecerli(k) Then
+        ProgramKlasoru = k
+        Exit Function
+    End If
+    ' 2) the folder chosen earlier
+    k = GetSetting("AnalizTakip", "Ayar", "Klasor", "")
+    If Gecerli(k) Then
+        ProgramKlasoru = k
+        Exit Function
+    End If
+    ' 3) ask
+    ProgramKlasoru = KlasorSec()
+End Function
+
+Public Sub KlasorDegistir()
+    Dim k As String
+    k = KlasorSec()
+    If Len(k) > 0 Then MsgBox "Program folder set to:" & vbCrLf & k, vbInformation, "Analysis Tracker"
+End Sub
+
+Public Sub ProgramiAc()
+    Dim k As String, betik As String, komut As String
+    k = ProgramKlasoru()
+    If Len(k) = 0 Then Exit Sub
+    betik = k & "\AnalizTakip.ps1"
+    komut = "powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File """ & betik & """"
+    On Error GoTo hata
+    CreateObject("WScript.Shell").Run komut, 0, False
+    Exit Sub
+hata:
+    MsgBox "The program could not be started: " & Err.Description, vbCritical, "Analysis Tracker"
+End Sub
+
+Public Sub VeriKlasoruAc()
+    Dim k As String
+    k = ProgramKlasoru()
+    If Len(k) = 0 Then Exit Sub
+    Shell "explorer.exe """ & k & "\Veri""", vbNormalFocus
+End Sub
+
+Public Sub HataGunluguAc()
+    Dim k As String, d As String
+    k = ProgramKlasoru()
+    If Len(k) = 0 Then Exit Sub
+    d = k & "\AnalizTakip.hata.log"
+    If Dir(d) = "" Then
+        MsgBox "There is no error log (no error has been recorded).", vbInformation, "Analysis Tracker"
+        Exit Sub
+    End If
+    Shell "notepad.exe """ & d & """", vbNormalFocus
+End Sub
+
+' ---------------------------------------------------------------------------
+' ONE-TIME SETUP: run this once (F5 inside this macro, or Alt+F8 > KurulumYap).
+' It builds the first sheet and its three buttons automatically.
+' ---------------------------------------------------------------------------
+Public Sub KurulumYap()
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(1)
+    ws.Activate
+    Dim i As Long
+    For i = ws.Buttons.Count To 1 Step -1
+        ws.Buttons(i).Delete
+    Next i
+    ws.Name = "Analysis Tracker"
+    ws.Cells.Clear
+    ActiveWindow.DisplayGridlines = False
+    ws.Columns("A").ColumnWidth = 3
+    ws.Columns("B").ColumnWidth = 34
+    ws.Range("B2").Value = "Analysis Tracker"
+    ws.Range("B2").Font.Size = 20
+    ws.Range("B2").Font.Bold = True
+    ws.Range("B2").Font.Color = RGB(31, 56, 100)
+    ws.Range("B3").Value = "Click the button below to open the program in its own window."
+    ws.Range("B3").Font.Color = RGB(110, 110, 110)
+    ButonEkle ws, "B5", 40, "Open Analysis Tracker", "ProgramiAc", True
+    ButonEkle ws, "B8", 26, "Open Data Folder", "VeriKlasoruAc", False
+    ButonEkle ws, "B10", 26, "Open Error Log", "HataGunluguAc", False
+    ButonEkle ws, "B12", 26, "Select Program Folder", "KlasorDegistir", False
+    ws.Range("A1").Select
+    MsgBox "Setup finished. Save the file as .xlsm (Ctrl+S) and use the buttons.", vbInformation, "Analysis Tracker"
+End Sub
+
+Private Sub ButonEkle(ws As Worksheet, hucre As String, yukseklik As Double, metin As String, makro As String, vurgu As Boolean)
+    Dim b As Object
+    With ws.Range(hucre)
+        Set b = ws.Buttons.Add(.Left, .Top, .Width, yukseklik)
+    End With
+    b.OnAction = makro
+    b.Caption = metin
+    b.Font.Size = IIf(vurgu, 12, 10)
+    b.Font.Bold = vurgu
+End Sub

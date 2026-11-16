@@ -1,0 +1,35 @@
+﻿ANALIZ TAKIP 14 - KURULUM (kisisel PC veya ortak klasor, nereye koyarsaniz orada calisir)
+==========================================================================
+
+Program dosyalari NEREYE konursa orada calisir: kendi bilgisayariniz, masaustu, belgeler veya ag klasoru.
+Ilk denemeyi kisisel PC'de yapabilirsiniz; ortak alana gecmek icin klasoru kopyalamak yeterlidir.
+
+1) PROGRAM KLASORU
+   - Herhangi bir yerde "AnalizTakip" adli bir klasor olusturun (ornek: C:\AnalizTakip).
+   - Su dosyalari (bu GitHub klasorundeki adlariyla, ad degistirmeden) bu klasore koyun:
+       AnalizTakip.ps1, Veri.ps1, README.txt, AdminAccounts.txt
+   - Program ilk acilista "Veri" alt klasorunu kendi olusturur.
+
+2) EXCEL DOSYASI (konumu onemli degil)
+   - Excel'de bos calisma kitabi (Blank workbook) ac > File > Save As > "Save as type" listesinden
+     "Excel Macro-Enabled Workbook (*.xlsm)" sec > Save.
+     (Normal "Excel Workbook (*.xlsx)" secilirse makro KAYDEDILMEZ.)
+     OneDrive/SharePoint'e kaydolmasi sorun degil; makro artik bunu kabul eder.
+   - Alt+F11 (Visual Basic Editor) > menuden Insert > Module. "makro.txt" icindeki TUM metni kopyalayip yapistirin.
+   - Imleci "Public Sub KurulumYap()" icine koyup F5'e basin: sayfa ve dugmeler otomatik olusur.
+   - Ctrl+S ile kaydedin (tur: Excel Macro-Enabled Workbook, *.xlsm).
+
+3) ILK TIKLAMA
+   - "Open Analysis Tracker" dugmesine basin. Program Excel dosyasinin yaninda bulunamazsa
+     bir klasor secme penceresi acilir: AnalizTakip klasorunu (icinde AnalizTakip.ps1 olan) secin.
+   - Secim hatirlanir; bir daha sorulmaz. Klasoru degistirmek icin "Select Program Folder" dugmesi vardir.
+
+4) UYARILAR
+   - "Makrolar devre disi" uyarisi cikarsa sari cubuktan "Icerigi Etkinlestir" deyin
+     (veya Dosya > Secenekler > Guven Merkezi > Guvenilen Konumlar'a dosyanin klasorunu ekleyin).
+   - Excel yine de olmuyorsa "Analysis Tracker.cmd" dosyasini AnalizTakip klasorunun
+     yanina koyup cift tiklayin; Excel'siz acar.
+   - Hata olursa AnalizTakip klasorundeki AnalizTakip.hata.log dosyasina bakin.
+
+NOT: Birden fazla kisi kullanacaksa Veri klasoru ortak ag klasorunde olmali; bu sizin karariniz,
+program nereye konursa orayi kullanir. (Program icinden Settings > Open data folder / Admin > Change data folder ile de degistirilebilir.)
