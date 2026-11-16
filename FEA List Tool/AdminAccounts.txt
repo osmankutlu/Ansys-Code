@@ -1,2 +1,0 @@
-# Optional: additional administrators. One Windows account per line, in the form DOMAIN\user (example: ACME\osman)
-# Lines starting with # are ignored. The first person who starts the program is the administrator automatically.
