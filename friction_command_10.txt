@@ -1,0 +1,897 @@
+# -*- coding: utf-8 -*-
+# friction_command_10  -  Friction (MP,MU) komutu ekleme araci
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (Form, Button, Label, MessageBox, MessageBoxButtons,
+                                  MessageBoxIcon, FormStartPosition, FormBorderStyle,
+                                  GroupBox, FlatStyle, TextBox, TreeView, TreeNode,
+                                  Application, ComboBox, ComboBoxStyle, Panel,
+                                  AnchorStyles, BorderStyle)
+from System.Drawing import Size, Point, Font, FontStyle, Color, Bitmap, Graphics, Icon, PointF, SolidBrush
+from System.Drawing.Drawing2D import SmoothingMode, GraphicsPath, FillMode
+from Ansys.Mechanical.DataModel.Enums import SequenceSelectionType
+from System import Array, DateTime
+from System.Threading import Thread
+import re
+import math
+
+# ---------------------------------------------------------------
+# Tema  (Neuber arayuzuyle ayni: renkler, yazi tipleri, flat butonlar, GroupBox duzeni, durum satiri)
+# ---------------------------------------------------------------
+ACCENT = Color.FromArgb(0, 120, 215)
+MUTED = Color.FromArgb(105, 105, 115)
+DARK = Color.FromArgb(35, 35, 40)
+ERR = Color.FromArgb(200, 40, 40)
+WARN = Color.FromArgb(190, 120, 0)
+OK = Color.FromArgb(30, 140, 60)
+BG = Color.FromArgb(245, 246, 248)
+ROW_A = Color.White
+ROW_B = Color.FromArgb(240, 245, 252)
+ORANGE_ROW = Color.FromArgb(255, 238, 214)     # onceden girilmis degerli satir
+ORANGE_CTRL = Color.FromArgb(255, 222, 186)    # o satirdaki secim kutulari
+F = Font("Segoe UI", 9.0)
+FB = Font("Segoe UI", 9.0, FontStyle.Bold)
+FH = Font("Segoe UI", 11.0, FontStyle.Bold)
+
+PRIMARY_TEXTS = [u"Start", u"Next >", u"Apply", u"Close"]
+
+
+def style_button(b, kind):
+    """kind: primary (mavi dolu) / danger (kirmizi dolu) / secondary (beyaz, mavi yazi)"""
+    b.FlatStyle = FlatStyle.Flat
+    b.Font = FB
+    if kind == u"primary" or kind == u"danger":
+        b.FlatAppearance.BorderSize = 0
+        b.BackColor = ERR if kind == u"danger" else ACCENT
+        b.ForeColor = Color.White
+    else:
+        b.FlatAppearance.BorderSize = 1
+        b.BackColor = Color.White
+        b.ForeColor = ACCENT
+
+
+def apply_theme(root):
+    """Eski formlardaki (ProgressForm, IterParamForm) butonlari Neuber stiline cevirir."""
+    for c in root.Controls:
+        try:
+            if isinstance(c, Button):
+                if c.Text == u"Stop":
+                    style_button(c, u"danger")
+                elif c.Text in PRIMARY_TEXTS:
+                    style_button(c, u"primary")
+                else:
+                    style_button(c, u"secondary")
+            elif isinstance(c, GroupBox) or isinstance(c, Panel):
+                apply_theme(c)
+        except:
+            pass
+
+
+def label(parent, text, x, y, w, h, font=F, color=DARK):
+    l = Label()
+    l.Text = text
+    l.Location = Point(x, y)
+    l.Size = Size(w, h)
+    l.Font = font
+    l.ForeColor = color
+    parent.Controls.Add(l)
+    return l
+
+
+def textbox(parent, x, y, w):
+    t = TextBox()
+    t.Font = F
+    t.Location = Point(x, y)
+    t.Size = Size(w, 24)
+    parent.Controls.Add(t)
+    return t
+
+
+def button(parent, text, x, y, w, primary=False, danger=False):
+    b = Button()
+    b.Text = text
+    style_button(b, u"danger" if danger else (u"primary" if primary else u"secondary"))
+    b.Location = Point(x, y)
+    b.Size = Size(w, 30)
+    parent.Controls.Add(b)
+    return b
+
+
+# ---------------------------------------------------------------
+# Scroll'u devre disi birakan ComboBox
+# ---------------------------------------------------------------
+def make_no_scroll_combo():
+    combo = ComboBox()
+    def on_mouse_wheel(sender, e):
+        try:
+            e.Handled = True
+        except:
+            pass
+    combo.MouseWheel += on_mouse_wheel
+    return combo
+
+
+def combo(parent, x, y, w):
+    c = make_no_scroll_combo()
+    c.DropDownStyle = ComboBoxStyle.DropDownList
+    c.Font = F
+    c.Location = Point(x, y)
+    c.Size = Size(w, 24)
+    parent.Controls.Add(c)
+    return c
+
+
+def make_icon():
+    """32x32 cark ikonu (8 dis, ortasi delik) - Neuber ile ayni."""
+    bmp = Bitmap(32, 32)
+    g = Graphics.FromImage(bmp)
+    g.SmoothingMode = SmoothingMode.AntiAlias
+    g.Clear(Color.Transparent)
+    N, R, r, t1, t2 = 8, 14.0, 10.5, 0.42 * math.pi / 8, 0.62 * math.pi / 8
+    path = GraphicsPath(FillMode.Alternate)
+    pts = []
+    for i in range(N):
+        a = 2 * math.pi * i / N
+        for rad, ang in ((r, a - t2), (R, a - t1), (R, a + t1), (r, a + t2)):
+            pts.append(PointF(16 + rad * math.cos(ang), 16 + rad * math.sin(ang)))
+    path.AddPolygon(Array[PointF](pts))
+    path.AddEllipse(11.5, 11.5, 9.0, 9.0)          # delik
+    g.FillPath(SolidBrush(ACCENT), path)
+    g.Dispose()
+    return Icon.FromHandle(bmp.GetHicon())
+
+
+_ICON = [None]
+
+
+def app_icon():
+    if _ICON[0] is None:
+        try:
+            _ICON[0] = make_icon()
+        except Exception:
+            _ICON[0] = False
+    return _ICON[0] if _ICON[0] else None
+
+
+def ckey(c):
+    """Kontak kimligi (ayni kontagi tekrar saymamak icin)"""
+    try:
+        return u"id" + unicode(str(c.ObjectId))
+    except:
+        return u"nm" + unicode(c.Name)
+
+
+
+# ---------------------------------------------------------------
+# Modeless pencere gosterimi: Mechanical kilitlenmez
+# ---------------------------------------------------------------
+_LIVE_FORMS = []
+
+
+def show_form(form, wait=True):
+    """Formu modeless acar (Mechanical'a erisim serbest). wait=True: pencere kapanana kadar
+    mesaj dongusunu calistirir (kapaninca DialogResult okunabilir). wait=False: hemen doner,
+    form acik kalir (referans tutulur)."""
+    form.Show()
+    if not wait:
+        _LIVE_FORMS.append(form)
+        return form
+    while form.Visible:
+        Application.DoEvents()
+        Thread.Sleep(15)
+    return form
+
+# ---------------------------------------------------------------
+# Sure formatla
+# ---------------------------------------------------------------
+def format_duration(elapsed_sec):
+    if elapsed_sec < 60:
+        return str(elapsed_sec) + u" sec"
+    else:
+        mins = elapsed_sec // 60
+        secs = elapsed_sec - mins * 60
+        return str(mins) + u" min " + str(secs) + u" sec"
+
+def fmt_val(x):
+    t = (u"%.8f" % x).rstrip(u"0").rstrip(u".")
+    if t == u"" or t == u"-":
+        t = u"0"
+    return t
+
+# ---------------------------------------------------------------
+# Kontak agaci verisi: alt basliklar (ic ice gruplar) korunur
+# Dugum = [isim, [dogrudan kontaklar], [alt gruplar]]
+# ---------------------------------------------------------------
+HIDDEN_SUPPRESSED = [0]
+MAX_DEPTH = 6
+
+
+def get_existing_cid(contact):
+    for child in contact.Children:
+        if "CommandSnippet" not in child.GetType().ToString():
+            continue
+        try:
+            matches = re.findall(r"cid_(\d+)\s*=\s*cid", child.Input)
+            if matches:
+                return int(matches[0])
+        except:
+            pass
+    return None
+
+
+def is_contact(obj):
+    try:
+        return "ContactRegion" in obj.GetType().ToString()
+    except Exception:
+        return False
+
+
+def get_children(obj):
+    try:
+        return list(obj.Children)
+    except Exception:
+        return []
+
+
+def find_max_existing_cid(obj, depth=0):
+    """Tum kontaklardaki (alt basliklar dahil) max cid numarasi."""
+    m = 0
+    for ch in get_children(obj):
+        if is_contact(ch):
+            cid = get_existing_cid(ch)
+            if cid is not None and cid > m:
+                m = cid
+        elif depth < MAX_DEPTH:
+            m = max(m, find_max_existing_cid(ch, depth + 1))
+    return m
+
+
+def is_suppressed(obj):
+    """Agacta 'x' simgesiyle gorunen (suppress edilmis) nesneleri birkac yontemle tespit eder."""
+    try:
+        if bool(obj.Suppressed):
+            return True
+    except Exception:
+        pass
+    try:
+        if "suppress" in str(obj.ObjectState).lower():
+            return True
+    except Exception:
+        pass
+    try:
+        if str(obj.Suppressed).strip().lower() in ("true", "yes", "1"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def collect_contacts(obj, path, depth, sup, found, order):
+    """Alt basliklari gezerek kontaklari toplar. Ayni kontak birden fazla yerde gorunurse
+    (ust klasor tum kontaklari duz listeleyebilir) EN DERIN yol (kendi klasoru) gecerli olur."""
+    for ch in get_children(obj):
+        if is_contact(ch):
+            k = ckey(ch)
+            s = sup or is_suppressed(ch)
+            rec = found.get(k)
+            if rec is None:
+                found[k] = [ch, path, s]
+                order.append(k)
+            elif len(path) > len(rec[1]):
+                rec[1] = path
+                rec[2] = s
+        elif depth < MAX_DEPTH:
+            try:
+                nm = unicode(ch.Name)
+            except Exception:
+                nm = u"?"
+            collect_contacts(ch, path + [nm], depth + 1, sup or is_suppressed(ch), found, order)
+
+
+def parent_path(c, root_key):
+    """Kontagin .Parent zinciri Connections'a ulasiyorsa klasor adlari (ustten alta); aksi halde None."""
+    names = []
+    o = c
+    for i in range(MAX_DEPTH + 2):
+        try:
+            p = o.Parent
+        except Exception:
+            return None
+        if p is None:
+            return None
+        try:
+            pk = ckey(p)
+        except Exception:
+            return None
+        if pk == root_key:
+            names.reverse()
+            return names
+        try:
+            names.append(unicode(p.Name))
+        except Exception:
+            return None
+        o = p
+    return None
+
+
+def prune_groups(g):
+    g[2] = [s for s in g[2] if prune_groups(s)]
+    return bool(g[1] or g[2])
+
+
+def build_contact_tree(connections):
+    """Kok dugum doner: [u"Connections", [kok kontaklar], [gruplar]]; kok dugumun kendisi agacta gosterilmez.
+    Gruplar kontagin gercek klasoruna gore kurulur (Connections > Contacts > klasorler ...).
+    Suppress edilmis kontaklar (ve gruplar) alinmaz."""
+    HIDDEN_SUPPRESSED[0] = 0
+    found = {}
+    order = []
+    collect_contacts(connections, [], 1, False, found, order)
+    try:
+        root_key = ckey(connections)
+    except Exception:
+        root_key = None
+    root = [u"Connections", [], []]
+    for k in order:
+        c, path, sup = found[k]
+        pp = parent_path(c, root_key) if root_key is not None else None
+        if pp is not None and len(pp) > len(path):
+            path = pp
+        if sup:
+            HIDDEN_SUPPRESSED[0] += 1
+            continue
+        node = root
+        for nm in path:
+            nxt = None
+            for sg in node[2]:
+                if sg[0] == nm:
+                    nxt = sg
+                    break
+            if nxt is None:
+                nxt = [nm, [], []]
+                node[2].append(nxt)
+            node = nxt
+        node[1].append(c)
+    prune_groups(root)
+    return root
+
+
+def count_contacts(g):
+    return len(g[1]) + sum(count_contacts(s) for s in g[2])
+
+
+def flatten_contacts(g):
+    out = list(g[1])
+    for s in g[2]:
+        out.extend(flatten_contacts(s))
+    return out
+
+
+# ---------------------------------------------------------------
+# Static Structural analizi bul
+# ---------------------------------------------------------------
+def find_static_structural(model):
+    for analysis in model.Analyses:
+        atype = str(analysis.AnalysisType).lower()
+        if "static" in atype or "staticstructural" in atype:
+            return analysis
+    return None
+
+# ---------------------------------------------------------------
+# Analizdeki step sayisini bul
+# ---------------------------------------------------------------
+def get_step_count(analysis):
+    try:
+        return int(analysis.AnalysisSettings.NumberOfSteps)
+    except:
+        pass
+    try:
+        return int(analysis.AnalysisSettings.InternalObject.NumberOfSteps)
+    except:
+        pass
+    return 1
+
+# ---------------------------------------------------------------
+# Friction komutu:  MP,MU,cid_N,deger
+# ---------------------------------------------------------------
+def make_cmd_line(cid_n, cmd_value):
+    return u"MP,MU,cid_" + str(cid_n) + u"," + cmd_value
+
+
+# ---------------------------------------------------------------
+# Mevcut ayni step'teki friction command'i bul
+# ---------------------------------------------------------------
+def find_existing_solution_cmd(analysis, step_num):
+    prefix = u"MP,MU,"
+    for child in analysis.Children:
+        if "CommandSnippet" not in child.GetType().ToString():
+            continue
+        try:
+            snum = None
+            try:
+                snum = int(child.StepNumber)
+            except:
+                pass
+            try:
+                snum = int(child.InternalObject.StepNumber)
+            except:
+                pass
+            if snum != step_num:
+                continue
+            if prefix.upper() in child.Input.upper():
+                return child
+        except:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------
+# Mevcut command'e ekle veya yeni olustur
+# ---------------------------------------------------------------
+def add_or_update_solution_cmd(analysis, cmd_value, cid_list, step_num):
+    existing  = find_existing_solution_cmd(analysis, step_num)
+    new_lines = [make_cmd_line(cid_n, cmd_value) for cid_n in cid_list]
+
+    if existing is not None:
+        current_lines = [l for l in existing.Input.split(u"\n") if l.strip()]
+        for line in new_lines:
+            if line not in current_lines:
+                current_lines.append(line)
+        existing.Input = u"\n".join(current_lines)
+        return existing, False
+    else:
+        cmd       = analysis.AddCommandSnippet()
+        cmd.Name  = u"APDL_FRICTION_STEP" + str(step_num)
+        cmd.Input = u"\n".join(new_lines)
+        cmd.StepSelectionMode = SequenceSelectionType.ByNumber
+        cmd.StepNumber        = step_num
+        return cmd, True
+
+
+# ---------------------------------------------------------------
+# CID atama (hem manuel hem iterasyon modu kullanir)
+# ---------------------------------------------------------------
+def assign_cids(selected, start_cid, prog, cancelled):
+    next_cid = start_cid
+    cid_list = []
+    reused   = 0
+    created  = 0
+    total    = len(selected)
+    for idx, (contact, existing_cid) in enumerate(selected):
+        if cancelled[0]:
+            break
+        prog.update(u"Adding CID commands...  (" + str(idx + 1) + u"/" + str(total) + u")",
+                    contact.Name)
+        if existing_cid is not None:
+            cid_list.append(existing_cid)
+            reused += 1
+        else:
+            next_cid += 1
+            cid_list.append(next_cid)
+            cmd_c       = contact.AddCommandSnippet()
+            cmd_c.Name  = u"Contact_Command_" + str(next_cid)
+            cmd_c.Input = u"cid_" + str(next_cid) + u" = cid"
+            created += 1
+    return cid_list, next_cid, reused, created
+
+# ---------------------------------------------------------------
+# Progress formu
+# ---------------------------------------------------------------
+class ProgressForm(Form):
+    def __init__(self):
+        self.Text            = u"Processing..."
+        self.ClientSize      = Size(420, 110)
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.FormBorderStyle = FormBorderStyle.FixedSingle
+        self.MaximizeBox     = False
+        self.MinimizeBox     = True
+        self.TopMost         = True
+        self.BackColor       = BG
+        self.Font            = F
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+
+        base_font  = F
+        font_bold  = Font(base_font, FontStyle.Bold)
+
+        self.lbl_status = Label()
+        self.lbl_status.Text     = u"Starting..."
+        self.lbl_status.Font     = font_bold
+        self.lbl_status.Location = Point(14, 14)
+        self.lbl_status.Size     = Size(300, 20)
+        self.Controls.Add(self.lbl_status)
+
+        self.lbl_detail = Label()
+        self.lbl_detail.Text      = u""
+        self.lbl_detail.Font      = base_font
+        self.lbl_detail.ForeColor = MUTED
+        self.lbl_detail.Location  = Point(14, 38)
+        self.lbl_detail.Size      = Size(390, 40)
+        self.Controls.Add(self.lbl_detail)
+
+        btn_stop = Button()
+        btn_stop.Text      = u"Stop"
+        btn_stop.Font      = font_bold
+        btn_stop.ForeColor = Color.White
+        btn_stop.BackColor = ERR
+        btn_stop.FlatStyle = FlatStyle.Standard
+        btn_stop.Location  = Point(314, 10)
+        btn_stop.Size      = Size(90, 32)
+        btn_stop.Click    += self._on_stop
+        self.Controls.Add(btn_stop)
+
+        self.FormClosing += self._on_closing
+        apply_theme(self)
+
+    def _on_stop(self, sender, e):
+        self._cancelled[0] = True
+        self.lbl_status.Text     = u"Stopping..."
+        self.lbl_detail.Text     = u"Aborting the running solve..."
+        Application.DoEvents()
+
+    def _on_closing(self, sender, e):
+        if not self._cancelled[0]:
+            self._cancelled[0] = True
+
+    def show_with(self, cancelled_ref):
+        self._cancelled = cancelled_ref
+        self.Show()
+        Application.DoEvents()
+
+    def update(self, status, detail=u""):
+        self.lbl_status.Text  = status
+        self.lbl_detail.Text  = detail
+        Application.DoEvents()
+
+
+# ---------------------------------------------------------------
+# Kontak agaci  (GroupBox icinde, checkbox'li; Neuber stilinde)
+# ---------------------------------------------------------------
+class ContactTree(object):
+    def __init__(self, parent, x, y, w, h, connections):
+        self.connections  = connections
+        self.start_cid    = 0
+        self.all_contacts = []
+        self._full        = []       # tum kontaklar (agac sirasinda)
+        self._root        = None
+        self._sel         = {}       # ckey -> True  (filtre degisse de secimler korunur)
+        self._ordered     = []       # gorunen: (node, contact, existing_cid)
+        self._groups      = []
+        self._updating    = False
+
+        gc = GroupBox()
+        gc.Text     = u"Contacts  (check to select)"
+        gc.Font     = FB
+        gc.Location = Point(x, y)
+        gc.Size     = Size(w, h)
+        gc.Anchor   = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        parent.Controls.Add(gc)
+        self.group = gc
+
+        lbs = label(gc, u"Search:", w - 12 - 210 - 52, 24, 50, 17, F, MUTED)
+        lbs.Anchor = AnchorStyles.Top | AnchorStyles.Right
+        self.txtSearch = textbox(gc, w - 12 - 210, 20, 210)
+        self.txtSearch.Anchor = AnchorStyles.Top | AnchorStyles.Right
+        self.txtSearch.TextChanged += self._on_search
+
+        self.lblInfo = label(gc, u"", 12, 48, w - 24, 17, F, MUTED)
+        self.lblInfo.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+
+        self.tv = TreeView()
+        self.tv.Font          = F
+        self.tv.Location      = Point(12, 70)
+        self.tv.Size          = Size(w - 24, h - 134)
+        self.tv.BorderStyle   = BorderStyle.FixedSingle
+        self.tv.CheckBoxes    = True
+        self.tv.ShowLines     = True
+        self.tv.ShowPlusMinus = True
+        self.tv.ShowRootLines = True
+        self.tv.Anchor        = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+        gc.Controls.Add(self.tv)
+        self.tv.AfterCheck += self._on_node_check
+
+        self.lblCid = label(gc, u"", 12, h - 60, w - 24, 17, F, MUTED)
+        self.lblCid.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+
+        b_all = button(gc, u"Select All", 12, h - 38, 100)
+        b_all.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+        b_all.Click += self._on_select_all
+        b_clr = button(gc, u"Clear All", 120, h - 38, 100)
+        b_clr.Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+        b_clr.Click += self._on_clear
+
+        self.reload(False)
+
+    # --- model / gorunum ---
+    def reload(self, keep_checked=True):
+        """Modeli yeniden okur (yeni CID'ler gorunsun diye); secimler ve filtre korunur."""
+        if keep_checked:
+            self._sync()
+        else:
+            self._sel = {}
+        self.start_cid = find_max_existing_cid(self.connections)
+        self._root = build_contact_tree(self.connections)
+        self._full = list(flatten_contacts(self._root))
+        self.all_contacts = [(c.Name, c) for c in self._full]
+        self._populate()
+        if self.start_cid > 0:
+            self.lblCid.Text = (u"Existing CIDs up to cid_" + str(self.start_cid) +
+                                u"  ->  new contacts will get cid_" + str(self.start_cid + 1) + u"+")
+        else:
+            self.lblCid.Text = u"No existing CIDs  ->  will start from cid_1"
+
+    def _filter_text(self):
+        try:
+            return self.txtSearch.Text.strip().lower()
+        except Exception:
+            return u""
+
+    def _filtered(self, g, f):
+        """Filtreye uyan kontaklari ve bos olmayan alt gruplari tutan kopya."""
+        cs  = [c for c in g[1] if f in c.Name.lower()]
+        sgs = []
+        for sg in g[2]:
+            fs = self._filtered(sg, f)
+            if count_contacts(fs) > 0:
+                sgs.append(fs)
+        return [g[0], cs, sgs]
+
+    def _populate(self):
+        f = self._filter_text()
+        root = self._root if not f else self._filtered(self._root, f)
+        self._updating = True
+        self.tv.BeginUpdate()
+        self.tv.Nodes.Clear()
+        self._ordered = []
+        self._groups  = []
+        for c in root[1]:                      # gruba bagli olmayan kontaklar kokte
+            self.tv.Nodes.Add(self._contact_node(c))
+        for g in root[2]:
+            self.tv.Nodes.Add(self._add_group(g))
+        for (node, c, ex) in self._ordered:
+            node.Checked = (ckey(c) in self._sel)
+        self._refresh_groups()
+        self._updating = False
+        self.tv.ExpandAll()
+        self.tv.EndUpdate()
+        self._update_info()
+
+    def _update_info(self):
+        txt = (u"Showing " + str(len(self._ordered)) + u" of " + str(len(self._full)) +
+               u"     |     selected: " + str(len(self._sel)) +
+               u"     |     suppressed hidden: " + str(HIDDEN_SUPPRESSED[0]))
+        self.lblInfo.Text = txt
+
+    def _sync(self):
+        """Gorunen dugumlerin isaretini _sel'e yazar (gizlenenlerin secimi korunur)."""
+        for (node, c, ex) in self._ordered:
+            k = ckey(c)
+            if node.Checked:
+                self._sel[k] = True
+            elif k in self._sel:
+                del self._sel[k]
+
+    def _on_search(self, sender, e):
+        self._sync()
+        self._populate()
+
+    def _refresh_groups(self):
+        for gn in reversed(self._groups):          # once en ic gruplar
+            gn.Checked = (gn.Nodes.Count > 0 and all(ch.Checked for ch in gn.Nodes))
+
+    def checked_keys(self):
+        self._sync()
+        return [ckey(c) for c in self._full if ckey(c) in self._sel]
+
+    def set_checked(self, keys):
+        self._sel = {}
+        for k in keys:
+            self._sel[k] = True
+        self._populate()
+
+    def _contact_node(self, c):
+        ex = get_existing_cid(c)
+        if ex is not None:
+            txt = c.Name + u"  [cid_" + str(ex) + u"]"
+        else:
+            txt = c.Name
+        ch          = TreeNode(txt)
+        ch.Tag      = u"CONTACT"
+        ch.NodeFont = F
+        self._ordered.append((ch, c, ex))
+        return ch
+
+    def _add_group(self, g):
+        gn          = TreeNode(g[0] + u"  [" + str(count_contacts(g)) + u" contacts]")
+        gn.Tag      = u"GROUP"
+        gn.NodeFont = FB
+        self._groups.append(gn)
+        for c in g[1]:
+            gn.Nodes.Add(self._contact_node(c))
+        for sg in g[2]:
+            gn.Nodes.Add(self._add_group(sg))
+        return gn
+
+    def selected(self):
+        """Isaretli kontaklar (filtre ile gizlenenler dahil): [(contact, existing_cid)]"""
+        self._sync()
+        return [(c, get_existing_cid(c)) for c in self._full if ckey(c) in self._sel]
+
+    def _set_desc(self, node, state):
+        for child in node.Nodes:
+            child.Checked = state
+            self._set_desc(child, state)
+
+    def _on_node_check(self, sender, e):
+        if self._updating:
+            return
+        self._updating = True
+        node = e.Node
+        if str(node.Tag) == u"GROUP":
+            self._set_desc(node, node.Checked)
+        parent = node.Parent
+        while parent is not None:
+            parent.Checked = all(child.Checked for child in parent.Nodes)
+            parent = parent.Parent
+        self._updating = False
+        self._sync()
+        self._update_info()
+
+    def _set_all(self, state):
+        """Sadece ekranda gorunen (filtreden gecen) kontaklari etkiler."""
+        self._updating = True
+        for gn in self._groups:
+            gn.Checked = state
+        for (node, c, ex) in self._ordered:
+            node.Checked = state
+        self._updating = False
+        self._sync()
+        self._update_info()
+
+    def _on_select_all(self, sender, e):
+        self._set_all(True)
+
+    def _on_clear(self, sender, e):
+        self._set_all(False)
+
+# ---------------------------------------------------------------
+# Arayuz
+# ---------------------------------------------------------------
+class FrictionForm(Form):
+    def __init__(self, analysis, connections, step_count):
+        self.analysis    = analysis
+        self.connections = connections
+        self.step_count  = step_count
+
+        self.Text = u"Friction Command"
+        ic = app_icon()
+        if ic is not None:
+            self.Icon = ic
+        W, H = 496, 700
+        self.ClientSize      = Size(W + 24, H)
+        self.MinimumSize     = Size(540, 640)
+        self.FormBorderStyle = FormBorderStyle.Sizable
+        self.StartPosition   = FormStartPosition.CenterScreen
+        self.BackColor       = BG
+        self.Font            = F
+
+        # Girdi
+        gi = GroupBox()
+        gi.Text     = u"Input"
+        gi.Font     = FB
+        gi.Location = Point(12, 10)
+        gi.Size     = Size(W, 96)
+        gi.Anchor   = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        self.Controls.Add(gi)
+        label(gi, u"Friction coefficient", 12, 22, 126, 18, F, MUTED)
+        label(gi, u"Active at step", 147, 22, 126, 18, F, MUTED)
+        self.txtV = textbox(gi, 12, 43, 126)
+        self.txtV.Text = u"0.15"
+        self.cbStep = combo(gi, 147, 43, 126)
+        for i in range(1, step_count + 1):
+            self.cbStep.Items.Add(u"Step " + str(i))
+        if self.cbStep.Items.Count > 0:
+            self.cbStep.SelectedIndex = 0
+        self.btnGo = button(gi, u"Apply", 282, 40, W - 24 - 270, primary=True)
+        self.btnGo.Anchor = AnchorStyles.Top | AnchorStyles.Right
+        self.btnGo.Click += self.on_apply
+        label(gi, u"->  MP,MU,cid_N,<value>        (" + str(step_count) + u" step(s) detected)",
+              12, 72, W - 24, 17, F, MUTED)
+
+        # alt kisimlarin yerlesimi
+        st_h = 56
+        st_y = H - 10 - st_h
+        ct_y = 114
+
+        # Kontaklar
+        self.ct = ContactTree(self, 12, ct_y, W, st_y - 6 - ct_y, connections)
+
+        self.lblStatus = label(self, u"Ready", 14, st_y, W - 4, st_h, F, MUTED)
+        self.lblStatus.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+
+    def status(self, text, color):
+        self.lblStatus.Text = text
+        self.lblStatus.ForeColor = color
+
+    def on_apply(self, sender, args):
+        val = self.txtV.Text.strip().replace(u",", u".")
+        try:
+            float(val)
+        except Exception:
+            self.status(u"Please enter a valid friction coefficient.", ERR)
+            return
+        if self.cbStep.SelectedIndex < 0:
+            self.status(u"Please select a step.", ERR)
+            return
+        sel = self.ct.selected()
+        if len(sel) == 0:
+            self.status(u"Please select at least one contact.", ERR)
+            return
+        self.run(sel, val, self.cbStep.SelectedIndex + 1)
+
+    def run(self, sel, val, step_num):
+        cancelled  = [False]
+        prog       = ProgressForm()
+        start_time = DateTime.Now
+        err        = None
+        res        = None
+        self.Enabled = False
+        try:
+            prog.Owner = self                 # pencere kapaninca odak bu forma donsun
+            prog.show_with(cancelled)
+            start_cid = find_max_existing_cid(self.connections)
+            cid_list, next_cid, reused, created = assign_cids(sel, start_cid, prog, cancelled)
+            if not cancelled[0]:
+                prog.update(u"Adding solution command to analysis...",
+                            u"Step " + str(step_num) + u"  |  FRICTION")
+                sol_cmd, is_new = add_or_update_solution_cmd(self.analysis, val, cid_list, step_num)
+                res = (start_cid, next_cid, reused, created, sol_cmd, is_new)
+        except Exception as ex:
+            err = unicode(str(ex))
+        was_cancelled = cancelled[0]            # prog.Close() bu bayragi True yapar, once oku
+        elapsed_sec   = int((DateTime.Now - start_time).TotalSeconds)
+        self.Enabled = True                     # once ana form aktif olsun, sonra progress kapansin
+        try:
+            prog.Close()
+        except Exception:
+            pass
+        self.Activate()
+
+        if err is not None:
+            self.status(u"Error: " + err, ERR)
+        elif was_cancelled or res is None:
+            self.status(u"Operation cancelled by user.", WARN)
+        else:
+            start_cid, next_cid, reused, created, sol_cmd, is_new = res
+            self.status(u"Done.  MP,MU = " + val + u"  at step " + str(step_num) + u"  ->  " +
+                        sol_cmd.Name + (u"  (new command)" if is_new else u"  (existing command updated)") +
+                        u"\n" + str(len(sel)) + u" contact(s):  " + str(reused) + u" reused CID, " +
+                        str(created) + u" new CID  |  " + format_duration(elapsed_sec), OK)
+        try:
+            self.ct.reload()                  # yeni CID'ler agacta gorunsun, secimler korunur
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------
+# ANA AKIS
+# ---------------------------------------------------------------
+model       = ExtAPI.DataModel.Project.Model
+connections = model.Connections
+
+contact_tree = build_contact_tree(connections)
+total_count  = count_contacts(contact_tree)
+
+if total_count == 0:
+    MessageBox.Show(u"No contacts found in the analysis.", u"Info",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information)
+else:
+    static_analysis = find_static_structural(model)
+    if static_analysis is None:
+        MessageBox.Show(u"No Static Structural analysis found in the model.", u"Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error)
+    else:
+        show_form(FrictionForm(static_analysis, connections, get_step_count(static_analysis)), False)
